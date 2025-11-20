@@ -1,0 +1,1 @@
+Namespace(sh_degree=3, source_path='/home/oper/imlab/jonny/gaussian-splatting/data/processed/stump', model_path='data/processed/stump/3dgs_output', images='images', depths='', resolution=-1, white_background=False, train_test_exp=False, data_device='cuda', eval=False)
