@@ -282,8 +282,8 @@ def main():
                        help='Error threshold for noise detection (0~1 range, combined error)')
     parser.add_argument('--min_size', type=int, default=50,
                        help='Minimum noise region size (pixels)')
-    parser.add_argument('--use_lpips', action='store_true', default=False,
-                       help='Use LPIPS + L1 combined (default: L1 only)')
+    parser.add_argument('--no_lpips', action='store_true', default=False,
+                       help='Disable LPIPS, use L1 only (default: LPIPS enabled)')
     parser.add_argument('--train_ratio', type=float, default=0.8, help='Train ratio')
     parser.add_argument('--val_ratio', type=float, default=0.1, help='Validation ratio')
     parser.add_argument('--test_ratio', type=float, default=0.1, help='Test ratio')
@@ -294,7 +294,7 @@ def main():
     print("Step 4: Error Map & Dataset Pairs Generation")
     print("=" * 60)
     print(f"Scene: {args.scene}")
-    print(f"Mode: {'L1 + LPIPS (combined)' if args.use_lpips else 'L1 only'}")
+    print(f"Mode: {'L1 only' if args.no_lpips else 'L1 + LPIPS (combined)'}")
     print(f"Threshold: {args.threshold}")
     print(f"Min size: {args.min_size}")
     print(f"Split: train={args.train_ratio}, val={args.val_ratio}, test={args.test_ratio}")
@@ -316,7 +316,7 @@ def main():
         threshold=args.threshold,
         min_size=args.min_size,
         device=args.device,
-        use_lpips=args.use_lpips
+        use_lpips=not args.no_lpips  # --no_lpips 플래그가 없으면 True (LPIPS 사용)
     )
 
     # 데이터 쌍 생성

@@ -23,10 +23,10 @@
 
 # Step 1: Train/Test Split
 python src/step1_split.py \
-  --scene stump \
+  --scene bicycle \
   --data_root ./data/360_v2 \
   --output_root ./data/processed \
-  --skip_frames 3
+  --skip_frames 1
 
 # Step 2: 3DGS Training (선택사항 - 이미 학습된 모델 사용 가능)
 python src/step2_train_3dgs.py \

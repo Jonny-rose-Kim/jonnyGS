@@ -230,7 +230,7 @@ def main():
     print("=" * 60 + "\n")
 
     # 경로 설정
-    source_image_dir = Path(args.data_root) / args.scene / "input"
+    source_image_dir = Path(args.data_root) / args.scene / "images" #"input"
     source_sparse_dir = Path(args.data_root) / args.scene / "sparse"
 
     dest_root = Path(args.output_root) / args.scene
