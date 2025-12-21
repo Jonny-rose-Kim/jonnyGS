@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Step 7: 3D Noise Gaussian Identification
+Step 7: 3D Noise Gaussian Identification (클러스터별 투표 방식)
 
 2D 노이즈 마스크를 3D 공간의 노이즈 가우시안으로 역투영합니다.
 
@@ -10,8 +10,9 @@ Step 7: 3D Noise Gaussian Identification
 3. 클러스터 내 novel view 생성 및 렌더링
 4. 노이즈 마스크 생성 (학습된 detector 사용)
 5. Ray-Gaussian intersection으로 노이즈 후보 추출
-6. 여러 뷰에서 교집합 계산 (투표 방식)
-7. 최종 노이즈 가우시안 저장
+6. **클러스터별** 투표로 노이즈 가우시안 결정
+7. 클러스터별 + Union 결과 저장
+8. 카메라 클러스터 시각화
 
 입력:
   - output/{scene}/ (Parent 3DGS 모델)
@@ -19,10 +20,17 @@ Step 7: 3D Noise Gaussian Identification
 
 출력:
   - data/processed/{scene}/noise_gaussians/
-    ├── noise_gaussians.json      # 노이즈 가우시안 인덱스 및 통계
-    ├── noise_gaussians.ply       # 노이즈 가우시안만 포함된 PLY
-    ├── clean_gaussians.ply       # 노이즈 제거된 PLY
-    └── visualization/            # 시각화 결과
+    ├── noise_gaussians.json           # 전체 통계 및 클러스터별 결과
+    ├── union_noise_gaussians.ply      # 모든 클러스터 Union 노이즈
+    ├── union_clean_gaussians.ply      # 모든 클러스터 Union 클린
+    ├── cluster_0/
+    │   ├── noise_gaussians.ply        # 클러스터 0 노이즈
+    │   └── clean_gaussians.ply        # 클러스터 0 클린
+    ├── cluster_1/
+    │   └── ...
+    └── visualization/
+        ├── camera_clusters.png        # 카메라 클러스터 시각화
+        └── cluster{N}_view{M}.png     # 렌더링 + 마스크
 """
 
 import torch
@@ -34,6 +42,8 @@ import numpy as np
 from tqdm import tqdm
 from collections import Counter
 import torchvision
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
 
 # Add project root to path
 project_root = Path(__file__).parent.parent
@@ -42,7 +52,7 @@ sys.path.insert(0, str(project_root))
 from gaussian_renderer import render, GaussianModel
 from scene import Scene
 from src.utils.camera_interpolation import interpolate_cameras, find_adjacent_camera_pairs
-from src.utils.camera_clustering import cluster_and_select_cameras, find_adjacent_pairs_in_cluster
+from src.utils.camera_clustering import cluster_and_select_cameras, find_adjacent_pairs_in_cluster, extract_camera_positions
 from src.utils.ray_gaussian_intersection import find_intersecting_gaussians, find_visible_gaussians
 from src.utils.detector_inference import load_detector
 
@@ -113,27 +123,150 @@ def render_view(gaussians, camera, background):
     return rendering
 
 
-def create_cluster_novel_views(cluster, max_views_per_cluster=5):
+def find_nearest_neighbor_pairs(cluster):
     """
-    클러스터 내에서 novel view 생성
+    각 카메라에 대해 가장 가까운 이웃 카메라를 찾아 쌍 생성
+    이미 쌍이 된 카메라는 skip
 
     Args:
         cluster: 카메라 리스트
-        max_views_per_cluster: 클러스터당 최대 novel view 수
+
+    Returns:
+        pairs: List[(cam, nearest_cam, distance)] - 카메라 쌍 (각 카메라는 한 번만 사용)
+    """
+    if len(cluster) < 2:
+        return []
+
+    positions = extract_camera_positions(cluster)
+    n = len(cluster)
+
+    # 이미 쌍이 된 카메라 인덱스 추적
+    used = set()
+    pairs = []
+
+    for i in range(n):
+        # 이미 쌍이 된 카메라는 skip
+        if i in used:
+            continue
+
+        # 사용되지 않은 카메라 중 가장 가까운 이웃 찾기
+        min_dist = float('inf')
+        nearest_idx = -1
+
+        for j in range(n):
+            if i == j or j in used:
+                continue
+            dist = np.linalg.norm(positions[i] - positions[j])
+            if dist < min_dist:
+                min_dist = dist
+                nearest_idx = j
+
+        if nearest_idx >= 0:
+            pairs.append((cluster[i], cluster[nearest_idx], min_dist))
+            used.add(i)
+            used.add(nearest_idx)
+
+    return pairs
+
+
+def create_cluster_novel_views(cluster, max_views_per_cluster=None):
+    """
+    클러스터 내에서 novel view 생성
+    각 카메라마다 가장 가까운 이웃과의 중점에 novel view 생성
+
+    Args:
+        cluster: 카메라 리스트
+        max_views_per_cluster: 최대 novel view 수 (None이면 카메라 수만큼)
 
     Returns:
         novel_views: List[(interp_cam, cam1, cam2, t)]
     """
-    # 인접 카메라 쌍 찾기
-    pairs = find_adjacent_pairs_in_cluster(cluster, max_pairs=max_views_per_cluster * 2)
+    # 각 카메라의 최근접 이웃 쌍 찾기
+    pairs = find_nearest_neighbor_pairs(cluster)
+
+    # max_views_per_cluster가 지정되면 제한
+    if max_views_per_cluster is not None:
+        pairs = pairs[:max_views_per_cluster]
 
     novel_views = []
-    for cam1, cam2, dist in pairs[:max_views_per_cluster]:
+    for cam1, cam2, dist in pairs:
         # 중점에서 보간
         interp_cam = interpolate_cameras(cam1, cam2, t=0.5)
         novel_views.append((interp_cam, cam1, cam2, 0.5))
 
     return novel_views
+
+
+def visualize_camera_clusters(clusters, all_cameras, save_path, scene_name=""):
+    """
+    카메라 클러스터를 3D로 시각화하고 저장
+
+    Args:
+        clusters: 선택된 클러스터 리스트 (List[List[Camera]])
+        all_cameras: 전체 카메라 리스트
+        save_path: 저장 경로
+        scene_name: Scene 이름 (제목용)
+    """
+    fig = plt.figure(figsize=(14, 10))
+    ax = fig.add_subplot(111, projection='3d')
+
+    # 전체 카메라 위치 (회색으로 배경 표시)
+    all_positions = extract_camera_positions(all_cameras)
+    ax.scatter(all_positions[:, 0], all_positions[:, 1], all_positions[:, 2],
+               c='lightgray', alpha=0.3, s=20, label='All cameras (unused)')
+
+    # 클러스터별 색상
+    colors = plt.cm.tab10(np.linspace(0, 1, len(clusters)))
+
+    cluster_info = []
+    for idx, (cluster, color) in enumerate(zip(clusters, colors)):
+        positions = extract_camera_positions(cluster)
+
+        # 카메라 위치 표시
+        ax.scatter(positions[:, 0], positions[:, 1], positions[:, 2],
+                   c=[color], s=80, label=f'Cluster {idx} ({len(cluster)} cams)',
+                   edgecolors='black', linewidths=0.5)
+
+        # 클러스터 중심 표시
+        centroid = np.mean(positions, axis=0)
+        ax.scatter([centroid[0]], [centroid[1]], [centroid[2]],
+                   c=[color], s=200, marker='*', edgecolors='black', linewidths=1)
+
+        # 카메라 이름 annotation (일부만)
+        for i, cam in enumerate(cluster):
+            if i % max(1, len(cluster) // 5) == 0:  # 5개 정도만 표시
+                ax.text(positions[i, 0], positions[i, 1], positions[i, 2],
+                        f'  {cam.image_name}', fontsize=6, alpha=0.7)
+
+        cluster_info.append({
+            'cluster_idx': idx,
+            'num_cameras': len(cluster),
+            'centroid': centroid.tolist(),
+            'camera_names': [cam.image_name for cam in cluster]
+        })
+
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+    ax.legend(loc='upper left', fontsize=8)
+    ax.set_title(f'Camera Clusters - {scene_name}\n'
+                 f'Total: {len(all_cameras)} cameras, '
+                 f'Selected: {sum(len(c) for c in clusters)} in {len(clusters)} clusters')
+
+    # 여러 각도에서 저장
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+
+    # 추가 각도 저장
+    base_path = Path(save_path)
+    for angle, elev in [(45, 20), (135, 20), (225, 20), (315, 20)]:
+        ax.view_init(elev=elev, azim=angle)
+        angle_path = base_path.parent / f"{base_path.stem}_angle{angle}{base_path.suffix}"
+        plt.savefig(angle_path, dpi=150, bbox_inches='tight')
+
+    plt.close()
+
+    return cluster_info
 
 
 def compute_noise_gaussians_voting(
@@ -241,7 +374,7 @@ def save_noise_gaussians_ply(gaussians, noise_indices, output_path, save_noise=T
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Step 7: 3D Noise Gaussian Identification')
+    parser = argparse.ArgumentParser(description='Step 7: 3D Noise Gaussian Identification (클러스터별 투표)')
     parser.add_argument('--scene', required=True, help='Scene name')
     parser.add_argument('--model_path', default=None,
                        help='Path to parent 3DGS model (default: output/{scene})')
@@ -255,10 +388,10 @@ def main():
                        help='Number of camera clusters')
     parser.add_argument('--min_cameras_per_cluster', type=int, default=5,
                        help='Minimum cameras per cluster')
-    parser.add_argument('--top_k_clusters', type=int, default=3,
-                       help='Number of top clusters to use')
-    parser.add_argument('--views_per_cluster', type=int, default=5,
-                       help='Novel views per cluster')
+    parser.add_argument('--top_k_clusters', type=int, default=None,
+                       help='Number of top clusters to use (default: all clusters)')
+    parser.add_argument('--views_per_cluster', type=int, default=None,
+                       help='Novel views per cluster (default: same as camera count in cluster)')
 
     # Ray-Gaussian intersection 파라미터
     parser.add_argument('--mahalanobis_threshold', type=float, default=3.0,
@@ -270,7 +403,7 @@ def main():
 
     # 투표 파라미터
     parser.add_argument('--vote_threshold', type=float, default=0.5,
-                       help='Vote threshold for noise classification')
+                       help='Vote threshold for noise classification (per cluster)')
 
     # 기타
     parser.add_argument('--image_size', type=int, default=256,
@@ -283,12 +416,14 @@ def main():
     args = parser.parse_args()
 
     print("=" * 80)
-    print("Step 7: 3D Noise Gaussian Identification")
+    print("Step 7: 3D Noise Gaussian Identification (클러스터별 투표)")
     print("=" * 80)
     print(f"Scene: {args.scene}")
-    print(f"Clusters: {args.n_clusters} → top {args.top_k_clusters}")
-    print(f"Views per cluster: {args.views_per_cluster}")
-    print(f"Vote threshold: {args.vote_threshold}")
+    top_k_str = "all" if args.top_k_clusters is None else args.top_k_clusters
+    print(f"Clusters: {args.n_clusters} → use {top_k_str}")
+    views_str = "= camera count" if args.views_per_cluster is None else args.views_per_cluster
+    print(f"Views per cluster: {views_str}")
+    print(f"Vote threshold (per cluster): {args.vote_threshold}")
     print(f"Mahalanobis threshold: {args.mahalanobis_threshold}")
     print("=" * 80 + "\n")
 
@@ -307,9 +442,8 @@ def main():
     output_dir = Path(args.output_root) / args.scene / "noise_gaussians"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.save_visualization:
-        vis_dir = output_dir / "visualization"
-        vis_dir.mkdir(exist_ok=True)
+    vis_dir = output_dir / "visualization"
+    vis_dir.mkdir(exist_ok=True)
 
     # 검증
     if not model_path.exists():
@@ -341,19 +475,38 @@ def main():
     if len(clusters) == 0:
         raise ValueError("No valid clusters found. Try lowering min_cameras_per_cluster.")
 
-    # 4. Novel view 생성 및 노이즈 후보 수집
-    print("\nGenerating novel views and collecting noise candidates...")
+    # 4. 카메라 클러스터 시각화
+    print("\nVisualizing camera clusters...")
+    cluster_vis_path = vis_dir / "camera_clusters.png"
+    cluster_info = visualize_camera_clusters(clusters, cameras, cluster_vis_path, args.scene)
+    print(f"  Saved cluster visualization to {cluster_vis_path}")
+
+    # 5. 클러스터별 Novel view 생성 및 노이즈 후보 수집
+    print("\nGenerating novel views and collecting noise candidates (per cluster)...")
     background = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
 
-    all_view_candidates = []
-    all_visible_gaussians = []
-    view_metadata = []
+    total_gaussians = gaussians.get_xyz.shape[0]
+
+    # 클러스터별 데이터 저장
+    cluster_results = []
+    union_noise_gaussians = set()  # 전체 Union
 
     total_views = sum(min(args.views_per_cluster, len(c) * (len(c) - 1) // 2)
                       for c in clusters)
 
     with tqdm(total=total_views, desc="Processing views") as pbar:
         for cluster_idx, cluster in enumerate(clusters):
+            print(f"\n  Processing Cluster {cluster_idx} ({len(cluster)} cameras)...")
+
+            # 클러스터별 출력 디렉토리
+            cluster_dir = output_dir / f"cluster_{cluster_idx}"
+            cluster_dir.mkdir(exist_ok=True)
+
+            # 클러스터 내 후보 수집
+            cluster_view_candidates = []
+            cluster_visible_gaussians = []
+            cluster_view_metadata = []
+
             # 클러스터 내 novel view 생성
             novel_views = create_cluster_novel_views(cluster, args.views_per_cluster)
 
@@ -369,21 +522,17 @@ def main():
                     vis_path = vis_dir / f"cluster{cluster_idx}_view{view_idx}.png"
                     # 마스크를 [3, H, W] 형태로 변환
                     if mask.dim() == 2:
-                        # [H, W] -> [3, H, W]
                         mask_vis = mask.unsqueeze(0).repeat(3, 1, 1)
                     elif mask.dim() == 3 and mask.shape[0] == 1:
-                        # [1, H, W] -> [3, H, W]
                         mask_vis = mask.repeat(3, 1, 1)
                     elif mask.dim() == 4:
-                        # [1, 1, H, W] -> [3, H, W]
                         mask_vis = mask.squeeze(0).repeat(3, 1, 1) if mask.shape[1] == 1 else mask.squeeze(0)
                     else:
                         mask_vis = mask
 
-                    # 크기 맞추기 (rendered와 mask 크기가 다를 수 있음)
+                    # 크기 맞추기
                     target_h, target_w = rendered.shape[1], rendered.shape[2]
                     if mask_vis.shape[1] != target_h or mask_vis.shape[2] != target_w:
-                        # [3, H, W] -> [1, 3, H, W] -> interpolate -> [3, H', W']
                         mask_vis = torch.nn.functional.interpolate(
                             mask_vis.unsqueeze(0),
                             size=(target_h, target_w),
@@ -405,11 +554,10 @@ def main():
                 # 가시 가우시안
                 visible = find_visible_gaussians(interp_cam, gaussians, args.min_opacity)
 
-                all_view_candidates.append(candidates)
-                all_visible_gaussians.append(visible)
+                cluster_view_candidates.append(candidates)
+                cluster_visible_gaussians.append(visible)
 
-                view_metadata.append({
-                    'cluster_idx': cluster_idx,
+                cluster_view_metadata.append({
                     'view_idx': view_idx,
                     'cam1': cam1.image_name,
                     'cam2': cam2.image_name,
@@ -421,24 +569,66 @@ def main():
 
                 pbar.update(1)
 
-    # 5. 투표 기반 노이즈 가우시안 결정
-    print("\nComputing noise gaussians by voting...")
-    noise_gaussians = compute_noise_gaussians_voting(
-        all_view_candidates,
-        all_visible_gaussians,
-        vote_threshold=args.vote_threshold
+            # 6. 클러스터별 투표
+            print(f"    Computing noise gaussians for cluster {cluster_idx}...")
+            cluster_noise_gaussians = compute_noise_gaussians_voting(
+                cluster_view_candidates,
+                cluster_visible_gaussians,
+                vote_threshold=args.vote_threshold
+            )
+
+            cluster_noise_ratio = len(cluster_noise_gaussians) / total_gaussians if total_gaussians > 0 else 0
+            print(f"    Cluster {cluster_idx}: {len(cluster_noise_gaussians)} noise gaussians ({cluster_noise_ratio*100:.2f}%)")
+
+            # Union에 추가
+            union_noise_gaussians.update(cluster_noise_gaussians)
+
+            # 클러스터별 PLY 저장
+            print(f"    Saving cluster {cluster_idx} PLY files...")
+            save_noise_gaussians_ply(
+                gaussians, cluster_noise_gaussians,
+                cluster_dir / "noise_gaussians.ply",
+                save_noise=True
+            )
+            save_noise_gaussians_ply(
+                gaussians, cluster_noise_gaussians,
+                cluster_dir / "clean_gaussians.ply",
+                save_noise=False
+            )
+
+            # 클러스터 결과 저장
+            cluster_results.append({
+                'cluster_idx': cluster_idx,
+                'num_cameras': len(cluster),
+                'num_views': len(novel_views),
+                'camera_names': [cam.image_name for cam in cluster],
+                'noise_gaussians_count': len(cluster_noise_gaussians),
+                'noise_ratio': cluster_noise_ratio,
+                'noise_gaussian_indices': sorted(list(cluster_noise_gaussians)),
+                'view_metadata': cluster_view_metadata
+            })
+
+    # 7. 최종 결과 저장 (모든 클러스터 Union)
+    print("\n" + "-" * 40)
+    print("Saving final results (all clusters combined)...")
+    final_noise_ratio = len(union_noise_gaussians) / total_gaussians if total_gaussians > 0 else 0
+
+    print(f"  Final noise gaussians: {len(union_noise_gaussians)} ({final_noise_ratio*100:.2f}%)")
+
+    save_noise_gaussians_ply(
+        gaussians, union_noise_gaussians,
+        output_dir / "noise_gaussians.ply",
+        save_noise=True
+    )
+    save_noise_gaussians_ply(
+        gaussians, union_noise_gaussians,
+        output_dir / "clean_gaussians.ply",
+        save_noise=False
     )
 
-    total_gaussians = gaussians.get_xyz.shape[0]
-    noise_ratio = len(noise_gaussians) / total_gaussians
+    # 8. JSON 결과 저장
+    print("\nSaving JSON results...")
 
-    print(f"  Total gaussians: {total_gaussians}")
-    print(f"  Noise gaussians: {len(noise_gaussians)} ({noise_ratio*100:.2f}%)")
-
-    # 6. 결과 저장
-    print("\nSaving results...")
-
-    # JSON 저장을 위한 헬퍼 함수
     def convert_to_serializable(obj):
         """numpy/torch 타입을 JSON 직렬화 가능한 타입으로 변환"""
         if isinstance(obj, (np.floating, np.float32, np.float64)):
@@ -457,8 +647,9 @@ def main():
         'scene': args.scene,
         'model_path': str(model_path),
         'total_gaussians': int(total_gaussians),
-        'noise_gaussians': len(noise_gaussians),
-        'noise_ratio': float(noise_ratio),
+        'noise_gaussians_count': len(union_noise_gaussians),
+        'noise_ratio': final_noise_ratio,
+        'clean_gaussians_count': total_gaussians - len(union_noise_gaussians),
         'parameters': {
             'n_clusters': args.n_clusters,
             'top_k_clusters': args.top_k_clusters,
@@ -469,41 +660,34 @@ def main():
             'min_opacity': args.min_opacity,
         },
         'cluster_statistics': convert_to_serializable(cluster_stats),
-        'view_metadata': convert_to_serializable(view_metadata),
-        'noise_gaussian_indices': sorted(list(noise_gaussians))
+        'cluster_info': convert_to_serializable(cluster_info),
+        'cluster_results': convert_to_serializable(cluster_results),
+        'noise_gaussian_indices': sorted(list(union_noise_gaussians))
     }
 
     with open(output_dir / "noise_gaussians.json", 'w') as f:
         json.dump(result, f, indent=2)
 
-    # PLY 저장
-    print("  Saving noise_gaussians.ply...")
-    save_noise_gaussians_ply(
-        gaussians, noise_gaussians,
-        output_dir / "noise_gaussians.ply",
-        save_noise=True
-    )
-
-    print("  Saving clean_gaussians.ply...")
-    save_noise_gaussians_ply(
-        gaussians, noise_gaussians,
-        output_dir / "clean_gaussians.ply",
-        save_noise=False
-    )
-
-    # 완료
+    # 완료 요약
     print("\n" + "=" * 80)
-    print("Step 7 Complete!")
+    print("Step 7 Complete! (클러스터별 투표 → 전체 Union)")
     print("=" * 80)
     print(f"Total gaussians: {total_gaussians}")
-    print(f"Noise gaussians: {len(noise_gaussians)} ({noise_ratio*100:.2f}%)")
-    print(f"Clean gaussians: {total_gaussians - len(noise_gaussians)}")
+    print(f"\nCluster-wise Voting Results:")
+    for cr in cluster_results:
+        print(f"  Cluster {cr['cluster_idx']}: {cr['noise_gaussians_count']} noise ({cr['noise_ratio']*100:.2f}%)")
+    print(f"\nFinal Result (Union of all clusters):")
+    print(f"  Noise gaussians: {len(union_noise_gaussians)} ({final_noise_ratio*100:.2f}%)")
+    print(f"  Clean gaussians: {total_gaussians - len(union_noise_gaussians)}")
     print(f"\nOutputs saved to: {output_dir}")
-    print("  - noise_gaussians.json")
-    print("  - noise_gaussians.ply")
-    print("  - clean_gaussians.ply")
+    print("  - noise_gaussians.ply (최종 노이즈)")
+    print("  - clean_gaussians.ply (노이즈 제거된 모델)")
+    print("  - noise_gaussians.json (전체 결과)")
+    for i in range(len(clusters)):
+        print(f"  - cluster_{i}/ (클러스터별 결과)")
+    print("  - visualization/camera_clusters.png")
     if args.save_visualization:
-        print("  - visualization/")
+        print("  - visualization/cluster*_view*.png")
     print("=" * 80)
 
 
