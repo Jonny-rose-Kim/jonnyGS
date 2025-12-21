@@ -169,14 +169,15 @@ def find_nearest_neighbor_pairs(cluster):
     return pairs
 
 
-def create_cluster_novel_views(cluster, max_views_per_cluster=None):
+def create_cluster_novel_views(cluster, max_views_per_cluster=None, num_interpolations=5):
     """
     클러스터 내에서 novel view 생성
-    각 카메라마다 가장 가까운 이웃과의 중점에 novel view 생성
+    각 카메라 쌍에서 균등한 간격으로 여러 개의 novel view 생성
 
     Args:
         cluster: 카메라 리스트
-        max_views_per_cluster: 최대 novel view 수 (None이면 카메라 수만큼)
+        max_views_per_cluster: 최대 novel view 수 (None이면 제한 없음)
+        num_interpolations: 각 쌍에서 생성할 novel view 수 (기본값 5)
 
     Returns:
         novel_views: List[(interp_cam, cam1, cam2, t)]
@@ -184,15 +185,18 @@ def create_cluster_novel_views(cluster, max_views_per_cluster=None):
     # 각 카메라의 최근접 이웃 쌍 찾기
     pairs = find_nearest_neighbor_pairs(cluster)
 
-    # max_views_per_cluster가 지정되면 제한
-    if max_views_per_cluster is not None:
-        pairs = pairs[:max_views_per_cluster]
-
     novel_views = []
     for cam1, cam2, dist in pairs:
-        # 중점에서 보간
-        interp_cam = interpolate_cameras(cam1, cam2, t=0.5)
-        novel_views.append((interp_cam, cam1, cam2, 0.5))
+        # 균등한 간격으로 여러 지점에서 보간
+        # num_interpolations=5면 t = 1/6, 2/6, 3/6, 4/6, 5/6
+        for i in range(num_interpolations):
+            t = (i + 1) / (num_interpolations + 1)
+            interp_cam = interpolate_cameras(cam1, cam2, t=t)
+            novel_views.append((interp_cam, cam1, cam2, t))
+
+    # max_views_per_cluster가 지정되면 제한
+    if max_views_per_cluster is not None:
+        novel_views = novel_views[:max_views_per_cluster]
 
     return novel_views
 
@@ -391,7 +395,9 @@ def main():
     parser.add_argument('--top_k_clusters', type=int, default=None,
                        help='Number of top clusters to use (default: all clusters)')
     parser.add_argument('--views_per_cluster', type=int, default=None,
-                       help='Novel views per cluster (default: same as camera count in cluster)')
+                       help='Max novel views per cluster (default: no limit)')
+    parser.add_argument('--num_interpolations', type=int, default=5,
+                       help='Number of novel views per camera pair (default: 5)')
 
     # Ray-Gaussian intersection 파라미터
     parser.add_argument('--mahalanobis_threshold', type=float, default=3.0,
@@ -421,8 +427,9 @@ def main():
     print(f"Scene: {args.scene}")
     top_k_str = "all" if args.top_k_clusters is None else args.top_k_clusters
     print(f"Clusters: {args.n_clusters} → use {top_k_str}")
-    views_str = "= camera count" if args.views_per_cluster is None else args.views_per_cluster
-    print(f"Views per cluster: {views_str}")
+    views_str = "no limit" if args.views_per_cluster is None else args.views_per_cluster
+    print(f"Max views per cluster: {views_str}")
+    print(f"Interpolations per pair: {args.num_interpolations}")
     print(f"Vote threshold (per cluster): {args.vote_threshold}")
     print(f"Mahalanobis threshold: {args.mahalanobis_threshold}")
     print("=" * 80 + "\n")
@@ -491,8 +498,15 @@ def main():
     cluster_results = []
     union_noise_gaussians = set()  # 전체 Union
 
-    total_views = sum(min(args.views_per_cluster, len(c) * (len(c) - 1) // 2)
-                      for c in clusters)
+    # total_views 계산: 각 클러스터의 쌍 수 * num_interpolations
+    def estimate_views_for_cluster(cluster_size):
+        num_pairs = cluster_size // 2  # 각 카메라는 한 번만 사용
+        num_views = num_pairs * args.num_interpolations
+        if args.views_per_cluster is not None:
+            num_views = min(num_views, args.views_per_cluster)
+        return num_views
+
+    total_views = sum(estimate_views_for_cluster(len(c)) for c in clusters)
 
     with tqdm(total=total_views, desc="Processing views") as pbar:
         for cluster_idx, cluster in enumerate(clusters):
@@ -508,7 +522,11 @@ def main():
             cluster_view_metadata = []
 
             # 클러스터 내 novel view 생성
-            novel_views = create_cluster_novel_views(cluster, args.views_per_cluster)
+            novel_views = create_cluster_novel_views(
+                cluster,
+                max_views_per_cluster=args.views_per_cluster,
+                num_interpolations=args.num_interpolations
+            )
 
             for view_idx, (interp_cam, cam1, cam2, t) in enumerate(novel_views):
                 # 렌더링
