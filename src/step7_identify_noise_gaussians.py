@@ -51,7 +51,10 @@ sys.path.insert(0, str(project_root))
 
 from gaussian_renderer import render, GaussianModel
 from scene import Scene
-from src.utils.camera_interpolation import interpolate_cameras, find_adjacent_camera_pairs
+from src.utils.camera_interpolation import (
+    interpolate_cameras, find_adjacent_camera_pairs,
+    interpolate_cameras_look_at, compute_scene_center_robust
+)
 from src.utils.camera_clustering import cluster_and_select_cameras, find_adjacent_pairs_in_cluster, extract_camera_positions
 from src.utils.ray_gaussian_intersection import find_intersecting_gaussians, find_visible_gaussians
 from src.utils.detector_inference import load_detector
@@ -169,15 +172,22 @@ def find_nearest_neighbor_pairs(cluster):
     return pairs
 
 
-def create_cluster_novel_views(cluster, max_views_per_cluster=None, num_interpolations=5):
+def create_cluster_novel_views(cluster, max_views_per_cluster=None, num_interpolations=5,
+                                scene_center=None, use_look_at=True, arc_interpolation=True):
     """
     클러스터 내에서 novel view 생성
     각 카메라 쌍에서 균등한 간격으로 여러 개의 novel view 생성
+
+    scene_center가 주어지면 look-at 기반 보간을 사용하여
+    항상 scene center를 바라보는 카메라 생성 (floating noise 검출에 효과적)
 
     Args:
         cluster: 카메라 리스트
         max_views_per_cluster: 최대 novel view 수 (None이면 제한 없음)
         num_interpolations: 각 쌍에서 생성할 novel view 수 (기본값 5)
+        scene_center: Scene 중심점 [3] (None이면 기존 방식 사용)
+        use_look_at: True면 scene_center를 바라보는 look-at 보간 사용
+        arc_interpolation: True면 scene 주위를 도는 arc 경로 사용
 
     Returns:
         novel_views: List[(interp_cam, cam1, cam2, t)]
@@ -191,7 +201,17 @@ def create_cluster_novel_views(cluster, max_views_per_cluster=None, num_interpol
         # num_interpolations=5면 t = 1/6, 2/6, 3/6, 4/6, 5/6
         for i in range(num_interpolations):
             t = (i + 1) / (num_interpolations + 1)
-            interp_cam = interpolate_cameras(cam1, cam2, t=t)
+
+            if scene_center is not None and use_look_at:
+                # Look-at 기반 보간: 항상 scene center를 바라봄
+                interp_cam = interpolate_cameras_look_at(
+                    cam1, cam2, scene_center, t=t,
+                    arc_interpolation=arc_interpolation
+                )
+            else:
+                # 기존 방식: 단순 카메라 보간
+                interp_cam = interpolate_cameras(cam1, cam2, t=t)
+
             novel_views.append((interp_cam, cam1, cam2, t))
 
     # max_views_per_cluster가 지정되면 제한
@@ -199,6 +219,28 @@ def create_cluster_novel_views(cluster, max_views_per_cluster=None, num_interpol
         novel_views = novel_views[:max_views_per_cluster]
 
     return novel_views
+
+
+def check_view_quality(rendered, min_valid_ratio=0.1):
+    """
+    렌더링된 뷰의 품질 검사 - 검은색(빈 공간) 비율이 너무 높으면 건너뜀
+
+    Args:
+        rendered: 렌더링된 이미지 [3, H, W]
+        min_valid_ratio: 최소 유효 픽셀 비율 (기본 10%)
+
+    Returns:
+        is_valid: 뷰가 유효한지 여부
+        valid_ratio: 유효 픽셀 비율
+    """
+    # 픽셀 밝기 계산 (RGB 평균)
+    brightness = rendered.mean(dim=0)  # [H, W]
+
+    # 너무 어두운 픽셀 = 가우시안이 없는 영역
+    valid_pixels = brightness > 0.01  # threshold
+    valid_ratio = valid_pixels.float().mean().item()
+
+    return valid_ratio >= min_valid_ratio, valid_ratio
 
 
 def visualize_camera_clusters(clusters, all_cameras, save_path, scene_name=""):
@@ -399,6 +441,18 @@ def main():
     parser.add_argument('--num_interpolations', type=int, default=5,
                        help='Number of novel views per camera pair (default: 5)')
 
+    # Look-at 기반 카메라 보간 (floating noise 검출 개선)
+    parser.add_argument('--use_look_at', action='store_true', default=True,
+                       help='Use look-at interpolation (always look at scene center)')
+    parser.add_argument('--no_look_at', dest='use_look_at', action='store_false',
+                       help='Disable look-at interpolation (use original method)')
+    parser.add_argument('--arc_interpolation', action='store_true', default=True,
+                       help='Use arc interpolation around scene center')
+    parser.add_argument('--no_arc', dest='arc_interpolation', action='store_false',
+                       help='Use linear interpolation instead of arc')
+    parser.add_argument('--min_valid_ratio', type=float, default=0.1,
+                       help='Minimum valid pixel ratio (skip views with too much black)')
+
     # Ray-Gaussian intersection 파라미터
     parser.add_argument('--mahalanobis_threshold', type=float, default=3.0,
                        help='Mahalanobis distance threshold')
@@ -432,6 +486,9 @@ def main():
     print(f"Interpolations per pair: {args.num_interpolations}")
     print(f"Vote threshold (per cluster): {args.vote_threshold}")
     print(f"Mahalanobis threshold: {args.mahalanobis_threshold}")
+    print(f"Look-at interpolation: {args.use_look_at}")
+    print(f"Arc interpolation: {args.arc_interpolation}")
+    print(f"Min valid pixel ratio: {args.min_valid_ratio}")
     print("=" * 80 + "\n")
 
     # 경로 설정
@@ -488,7 +545,14 @@ def main():
     cluster_info = visualize_camera_clusters(clusters, cameras, cluster_vis_path, args.scene)
     print(f"  Saved cluster visualization to {cluster_vis_path}")
 
-    # 5. 클러스터별 Novel view 생성 및 노이즈 후보 수집
+    # 5. Scene center 계산 (look-at 보간 사용 시)
+    scene_center = None
+    if args.use_look_at:
+        print("\nComputing scene center (robust, 90th percentile)...")
+        scene_center = compute_scene_center_robust(gaussians, percentile=90)
+        print(f"  Scene center: [{scene_center[0]:.3f}, {scene_center[1]:.3f}, {scene_center[2]:.3f}]")
+
+    # 6. 클러스터별 Novel view 생성 및 노이즈 후보 수집
     print("\nGenerating novel views and collecting noise candidates (per cluster)...")
     background = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
 
@@ -521,16 +585,27 @@ def main():
             cluster_visible_gaussians = []
             cluster_view_metadata = []
 
-            # 클러스터 내 novel view 생성
+            # 클러스터 내 novel view 생성 (look-at 기반)
             novel_views = create_cluster_novel_views(
                 cluster,
                 max_views_per_cluster=args.views_per_cluster,
-                num_interpolations=args.num_interpolations
+                num_interpolations=args.num_interpolations,
+                scene_center=scene_center,
+                use_look_at=args.use_look_at,
+                arc_interpolation=args.arc_interpolation
             )
 
+            skipped_views = 0
             for view_idx, (interp_cam, cam1, cam2, t) in enumerate(novel_views):
                 # 렌더링
                 rendered = render_view(gaussians, interp_cam, background)
+
+                # View quality check - 검은색 영역이 너무 많으면 건너뜀
+                is_valid, valid_ratio = check_view_quality(rendered, args.min_valid_ratio)
+                if not is_valid:
+                    skipped_views += 1
+                    pbar.update(1)
+                    continue
 
                 # 노이즈 마스크 예측
                 mask = detector.predict_from_tensor(rendered)
@@ -582,12 +657,16 @@ def main():
                     'interpolation_t': t,
                     'noise_candidates': len(candidates),
                     'visible_gaussians': len(visible),
-                    'mask_noise_ratio': float(mask.mean().item())
+                    'mask_noise_ratio': float(mask.mean().item()),
+                    'valid_pixel_ratio': valid_ratio
                 })
 
                 pbar.update(1)
 
-            # 6. 클러스터별 투표
+            if skipped_views > 0:
+                print(f"    Skipped {skipped_views} views with too much black (< {args.min_valid_ratio*100:.0f}% valid pixels)")
+
+            # 클러스터별 투표 (유효한 뷰가 있을 때만)
             print(f"    Computing noise gaussians for cluster {cluster_idx}...")
             cluster_noise_gaussians = compute_noise_gaussians_voting(
                 cluster_view_candidates,
@@ -619,6 +698,8 @@ def main():
                 'cluster_idx': cluster_idx,
                 'num_cameras': len(cluster),
                 'num_views': len(novel_views),
+                'num_valid_views': len(novel_views) - skipped_views,
+                'num_skipped_views': skipped_views,
                 'camera_names': [cam.image_name for cam in cluster],
                 'noise_gaussians_count': len(cluster_noise_gaussians),
                 'noise_ratio': cluster_noise_ratio,
@@ -676,7 +757,11 @@ def main():
             'sample_ratio': args.sample_ratio,
             'vote_threshold': args.vote_threshold,
             'min_opacity': args.min_opacity,
+            'use_look_at': args.use_look_at,
+            'arc_interpolation': args.arc_interpolation,
+            'min_valid_ratio': args.min_valid_ratio,
         },
+        'scene_center': scene_center.tolist() if scene_center is not None else None,
         'cluster_statistics': convert_to_serializable(cluster_stats),
         'cluster_info': convert_to_serializable(cluster_info),
         'cluster_results': convert_to_serializable(cluster_results),
