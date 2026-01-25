@@ -12,13 +12,13 @@ import sys
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-from src.models.simple_unet import SimpleUNet
+from src.models.simple_unet import SimpleUNet, DeepUNet
 
 
 class NoiseDetector:
     """Wrapper for noise detection model inference"""
 
-    def __init__(self, checkpoint_path, device='cuda', image_size=256):
+    def __init__(self, checkpoint_path, device='cuda', image_size=256, model_type='auto'):
         """
         Initialize detector.
 
@@ -26,19 +26,38 @@ class NoiseDetector:
             checkpoint_path: Path to trained model checkpoint
             device: Device to run inference on
             image_size: Input image size for model
+            model_type: 'simple', 'deep', or 'auto' (auto-detect from checkpoint)
         """
         self.device = device
         self.image_size = image_size
 
-        # Load model
-        self.model = SimpleUNet(in_channels=3, out_channels=1)
+        # Load checkpoint
         checkpoint = torch.load(checkpoint_path, map_location=device)
+
+        # Auto-detect model type from checkpoint
+        if model_type == 'auto':
+            state_dict = checkpoint['model_state_dict']
+            # DeepUNet uses 'encoders' and 'decoders', SimpleUNet uses 'enc1', 'dec1' etc.
+            if any('encoders' in key for key in state_dict.keys()):
+                model_type = 'deep'
+            else:
+                model_type = 'simple'
+
+        # Load model
+        if model_type == 'deep':
+            self.model = DeepUNet(in_channels=3, out_channels=1)
+            print(f"✓ Using DeepUNet model")
+        else:
+            self.model = SimpleUNet(in_channels=3, out_channels=1)
+            print(f"✓ Using SimpleUNet model")
+
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.model.to(device)
         self.model.eval()
 
         print(f"✓ Loaded detector model from {checkpoint_path}")
-        best_iou = checkpoint.get('best_iou', None)
+        # Try both 'best_iou' and 'iou' keys
+        best_iou = checkpoint.get('best_iou', checkpoint.get('iou', None))
         if best_iou is not None:
             print(f"  - Best IoU: {best_iou:.4f}")
         else:

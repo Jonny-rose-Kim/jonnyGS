@@ -53,7 +53,9 @@ from gaussian_renderer import render, GaussianModel
 from scene import Scene
 from src.utils.camera_interpolation import (
     interpolate_cameras, find_adjacent_camera_pairs,
-    interpolate_cameras_look_at, compute_scene_center_robust
+    interpolate_cameras_look_at, compute_scene_center_robust,
+    compute_scene_center_from_cameras, compute_scene_center_from_gaze,
+    estimate_scene_up_vector
 )
 from src.utils.camera_clustering import cluster_and_select_cameras, find_adjacent_pairs_in_cluster, extract_camera_positions
 from src.utils.ray_gaussian_intersection import find_intersecting_gaussians, find_visible_gaussians
@@ -173,7 +175,8 @@ def find_nearest_neighbor_pairs(cluster):
 
 
 def create_cluster_novel_views(cluster, max_views_per_cluster=None, num_interpolations=5,
-                                scene_center=None, use_look_at=True, arc_interpolation=True):
+                                scene_center=None, use_look_at=True, arc_interpolation=True,
+                                world_up=None):
     """
     클러스터 내에서 novel view 생성
     각 카메라 쌍에서 균등한 간격으로 여러 개의 novel view 생성
@@ -188,6 +191,7 @@ def create_cluster_novel_views(cluster, max_views_per_cluster=None, num_interpol
         scene_center: Scene 중심점 [3] (None이면 기존 방식 사용)
         use_look_at: True면 scene_center를 바라보는 look-at 보간 사용
         arc_interpolation: True면 scene 주위를 도는 arc 경로 사용
+        world_up: Scene의 world up vector [3] (모든 카메라에서 추정됨)
 
     Returns:
         novel_views: List[(interp_cam, cam1, cam2, t)]
@@ -206,7 +210,8 @@ def create_cluster_novel_views(cluster, max_views_per_cluster=None, num_interpol
                 # Look-at 기반 보간: 항상 scene center를 바라봄
                 interp_cam = interpolate_cameras_look_at(
                     cam1, cam2, scene_center, t=t,
-                    arc_interpolation=arc_interpolation
+                    arc_interpolation=arc_interpolation,
+                    world_up=world_up
                 )
             else:
                 # 기존 방식: 단순 카메라 보간
@@ -378,7 +383,13 @@ def save_noise_gaussians_ply(gaussians, noise_indices, output_path, save_noise=T
     if not save_noise:
         mask = ~mask  # 클린 가우시안
 
-    print(f"    Saving {mask.sum().item()} gaussians (save_noise={save_noise})")
+    num_gaussians = mask.sum().item()
+    print(f"    Saving {num_gaussians} gaussians (save_noise={save_noise})")
+
+    # 빈 배열 처리
+    if num_gaussians == 0:
+        print(f"    Warning: No gaussians to save, skipping {output_path}")
+        return
 
     # 데이터 추출
     xyz = gaussians.get_xyz[mask].detach().cpu().numpy()
@@ -453,6 +464,19 @@ def main():
     parser.add_argument('--min_valid_ratio', type=float, default=0.1,
                        help='Minimum valid pixel ratio (skip views with too much black)')
 
+    # Scene center 계산 방식
+    parser.add_argument('--scene_center_method', type=str, default='camera',
+                       choices=['camera', 'gaze', 'gaussian'],
+                       help='Scene center calculation method: '
+                            'camera (카메라 centroid, 360도 scene 추천), '
+                            'gaze (카메라 시선 방향 기반), '
+                            'gaussian (가우시안 centroid)')
+    parser.add_argument('--gaze_distance', type=float, default=2.0,
+                       help='Distance along gaze direction for gaze method (meters)')
+    parser.add_argument('--scene_center', type=float, nargs=3, default=None,
+                       metavar=('X', 'Y', 'Z'),
+                       help='Manual scene center override (e.g., --scene_center 0 0 0)')
+
     # Ray-Gaussian intersection 파라미터
     parser.add_argument('--mahalanobis_threshold', type=float, default=3.0,
                        help='Mahalanobis distance threshold')
@@ -489,6 +513,9 @@ def main():
     print(f"Look-at interpolation: {args.use_look_at}")
     print(f"Arc interpolation: {args.arc_interpolation}")
     print(f"Min valid pixel ratio: {args.min_valid_ratio}")
+    print(f"Scene center method: {args.scene_center_method}")
+    if args.scene_center:
+        print(f"Scene center override: {args.scene_center}")
     print("=" * 80 + "\n")
 
     # 경로 설정
@@ -545,12 +572,35 @@ def main():
     cluster_info = visualize_camera_clusters(clusters, cameras, cluster_vis_path, args.scene)
     print(f"  Saved cluster visualization to {cluster_vis_path}")
 
-    # 5. Scene center 계산 (look-at 보간 사용 시)
+    # 5. World up vector 및 Scene center 계산 (look-at 보간 사용 시)
     scene_center = None
+    world_up = None
     if args.use_look_at:
-        print("\nComputing scene center (robust, 90th percentile)...")
-        scene_center = compute_scene_center_robust(gaussians, percentile=90)
-        print(f"  Scene center: [{scene_center[0]:.3f}, {scene_center[1]:.3f}, {scene_center[2]:.3f}]")
+        # World up vector 계산 (모든 카메라에서)
+        print("\nEstimating world up vector from all cameras...")
+        world_up = estimate_scene_up_vector(cameras)
+        print(f"  World up: [{world_up[0]:.3f}, {world_up[1]:.3f}, {world_up[2]:.3f}]")
+
+    if args.use_look_at:
+        if args.scene_center is not None:
+            # 수동 지정
+            scene_center = np.array(args.scene_center)
+            print(f"\nUsing manual scene center: [{scene_center[0]:.3f}, {scene_center[1]:.3f}, {scene_center[2]:.3f}]")
+        elif args.scene_center_method == 'camera':
+            # 카메라 중심 (360도 scene에 적합)
+            print("\nComputing scene center from camera positions (360-degree scene)...")
+            scene_center = compute_scene_center_from_cameras(cameras)
+            print(f"  Scene center (camera centroid): [{scene_center[0]:.3f}, {scene_center[1]:.3f}, {scene_center[2]:.3f}]")
+        elif args.scene_center_method == 'gaze':
+            # 카메라 시선 방향 기반
+            print(f"\nComputing scene center from camera gaze (distance={args.gaze_distance}m)...")
+            scene_center = compute_scene_center_from_gaze(cameras, distance=args.gaze_distance)
+            print(f"  Scene center (gaze-based): [{scene_center[0]:.3f}, {scene_center[1]:.3f}, {scene_center[2]:.3f}]")
+        else:
+            # 가우시안 기반 (기존 방식)
+            print("\nComputing scene center from gaussians (robust, 90th percentile)...")
+            scene_center = compute_scene_center_robust(gaussians, percentile=90)
+            print(f"  Scene center (gaussian centroid): [{scene_center[0]:.3f}, {scene_center[1]:.3f}, {scene_center[2]:.3f}]")
 
     # 6. 클러스터별 Novel view 생성 및 노이즈 후보 수집
     print("\nGenerating novel views and collecting noise candidates (per cluster)...")
@@ -592,7 +642,8 @@ def main():
                 num_interpolations=args.num_interpolations,
                 scene_center=scene_center,
                 use_look_at=args.use_look_at,
-                arc_interpolation=args.arc_interpolation
+                arc_interpolation=args.arc_interpolation,
+                world_up=world_up
             )
 
             skipped_views = 0
@@ -760,8 +811,12 @@ def main():
             'use_look_at': args.use_look_at,
             'arc_interpolation': args.arc_interpolation,
             'min_valid_ratio': args.min_valid_ratio,
+            'scene_center_method': args.scene_center_method,
+            'gaze_distance': args.gaze_distance,
         },
         'scene_center': scene_center.tolist() if scene_center is not None else None,
+        'scene_center_manual': args.scene_center,
+        'world_up': world_up.tolist() if world_up is not None else None,
         'cluster_statistics': convert_to_serializable(cluster_stats),
         'cluster_info': convert_to_serializable(cluster_info),
         'cluster_results': convert_to_serializable(cluster_results),

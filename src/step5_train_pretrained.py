@@ -29,7 +29,7 @@ from tqdm import tqdm
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from src.models.simple_unet import SimpleUNet
+from src.models.simple_unet import SimpleUNet, DeepUNet
 
 
 class NoisePairDataset(Dataset):
@@ -147,6 +147,8 @@ def main():
     parser.add_argument('--image_size', type=int, default=256, help='Image size')
     parser.add_argument('--device', default='cuda', help='Device')
     parser.add_argument('--num_workers', type=int, default=4, help='DataLoader workers')
+    parser.add_argument('--model', default='simple', choices=['simple', 'deep'],
+                        help='Model architecture: simple or deep')
     args = parser.parse_args()
 
     device = args.device if torch.cuda.is_available() else 'cpu'
@@ -160,6 +162,7 @@ def main():
     print(f"Batch Size: {args.batch_size}")
     print(f"Epochs: {args.num_epochs}")
     print(f"Image Size: {args.image_size}")
+    print(f"Model: {args.model}")
     print("=" * 60 + "\n")
 
     # Paths
@@ -206,7 +209,12 @@ def main():
     )
 
     # Model
-    model = SimpleUNet(in_channels=3, out_channels=1).to(device)
+    if args.model == 'deep':
+        model = DeepUNet(in_channels=3, out_channels=1).to(device)
+        print(f"Using DeepUNet (5 levels, 1024 max channels)")
+    else:
+        model = SimpleUNet(in_channels=3, out_channels=1).to(device)
+        print(f"Using SimpleUNet (4 levels, 512 max channels)")
     criterion = nn.BCELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(

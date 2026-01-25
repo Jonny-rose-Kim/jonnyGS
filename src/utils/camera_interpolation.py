@@ -260,18 +260,21 @@ def create_interpolated_views(cameras, num_interpolations=1, max_pairs=None):
     return interpolated_views
 
 
-def compute_look_at_rotation(camera_pos, target_pos, up=np.array([0, 0, 1])):
+def compute_look_at_rotation(camera_pos, target_pos, up=None):
     """
     Compute rotation matrix for camera looking at target.
 
     Args:
         camera_pos: Camera position [3]
         target_pos: Target position to look at [3]
-        up: Up vector (default: Z-up)
+        up: Up vector (if None, uses [0, -1, 0] which works for many scenes)
 
     Returns:
         R: 3x3 rotation matrix (world to camera)
     """
+    if up is None:
+        up = np.array([0, -1, 0])  # Y-down is common in many coordinate systems
+
     # Forward direction (camera to target)
     forward = target_pos - camera_pos
     forward = forward / (np.linalg.norm(forward) + 1e-8)
@@ -281,7 +284,7 @@ def compute_look_at_rotation(camera_pos, target_pos, up=np.array([0, 0, 1])):
     right_norm = np.linalg.norm(right)
     if right_norm < 1e-6:
         # forward is parallel to up, use alternative up
-        up = np.array([0, 1, 0])
+        up = np.array([0, 0, 1])
         right = np.cross(forward, up)
         right_norm = np.linalg.norm(right)
     right = right / (right_norm + 1e-8)
@@ -301,7 +304,31 @@ def compute_look_at_rotation(camera_pos, target_pos, up=np.array([0, 0, 1])):
     return R
 
 
-def interpolate_cameras_look_at(cam1, cam2, scene_center, t=0.5, arc_interpolation=True):
+def estimate_scene_up_vector(cameras):
+    """
+    Estimate the scene's up vector from camera orientations.
+
+    Args:
+        cameras: List of camera objects
+
+    Returns:
+        up: Estimated up vector [3]
+    """
+    up_vectors = []
+    for cam in cameras:
+        R = cam.R if isinstance(cam.R, np.ndarray) else cam.R.cpu().numpy()
+        # Camera's up direction is -R[1,:] (negative Y-axis in camera space)
+        up = -R[1, :]
+        up_vectors.append(up)
+
+    up_vectors = np.array(up_vectors)
+    avg_up = up_vectors.mean(axis=0)
+    avg_up = avg_up / (np.linalg.norm(avg_up) + 1e-8)
+
+    return avg_up
+
+
+def interpolate_cameras_look_at(cam1, cam2, scene_center, t=0.5, arc_interpolation=True, world_up=None):
     """
     Interpolate camera position while always looking at scene center.
     This is better for detecting floating noise as it keeps the scene in view.
@@ -313,6 +340,7 @@ def interpolate_cameras_look_at(cam1, cam2, scene_center, t=0.5, arc_interpolati
         t: Interpolation parameter [0, 1]
         arc_interpolation: If True, interpolate along arc around scene center
                           If False, linear interpolation of position
+        world_up: Scene's world up vector [3] (should be pre-computed from all cameras)
 
     Returns:
         Interpolated camera object looking at scene_center
@@ -328,6 +356,12 @@ def interpolate_cameras_look_at(cam1, cam2, scene_center, t=0.5, arc_interpolati
         pos2 = np.array(cam2.camera_center)
 
     scene_center = np.array(scene_center)
+
+    # Use provided world_up or default to Y-down
+    if world_up is None:
+        world_up = np.array([0, -1, 0])
+    else:
+        world_up = np.array(world_up)
 
     if arc_interpolation:
         # Arc interpolation: move along a circular arc around scene center
@@ -375,7 +409,7 @@ def interpolate_cameras_look_at(cam1, cam2, scene_center, t=0.5, arc_interpolati
         pos_interp = (1 - t) * pos1 + t * pos2
 
     # Compute look-at rotation toward scene center
-    R_interp = compute_look_at_rotation(pos_interp, scene_center)
+    R_interp = compute_look_at_rotation(pos_interp, scene_center, up=world_up)
 
     # Create camera copy
     interp_cam = copy.copy(cam1)
@@ -470,3 +504,67 @@ def compute_scene_center_robust(gaussians, percentile=90):
     center = (xyz[mask] * weights[:, np.newaxis]).sum(axis=0)
 
     return center
+
+
+def compute_scene_center_from_cameras(cameras):
+    """
+    Compute scene center from camera positions.
+    For 360-degree scenes, the camera centroid is typically the object of interest.
+
+    Args:
+        cameras: List of camera objects
+
+    Returns:
+        scene_center: [3] numpy array
+    """
+    positions = []
+    for cam in cameras:
+        if isinstance(cam.camera_center, torch.Tensor):
+            pos = cam.camera_center.cpu().numpy()
+        else:
+            pos = np.array(cam.camera_center)
+        positions.append(pos)
+
+    positions = np.array(positions)
+    return positions.mean(axis=0)
+
+
+def compute_scene_center_from_gaze(cameras, distance=2.0):
+    """
+    Compute scene center from camera gaze directions.
+    Takes the camera centroid and moves along average gaze direction.
+
+    Args:
+        cameras: List of camera objects
+        distance: Distance to move along gaze direction (meters)
+
+    Returns:
+        scene_center: [3] numpy array
+    """
+    positions = []
+    look_dirs = []
+
+    for cam in cameras:
+        if isinstance(cam.camera_center, torch.Tensor):
+            pos = cam.camera_center.cpu().numpy()
+        else:
+            pos = np.array(cam.camera_center)
+        positions.append(pos)
+
+        # Extract look direction from rotation matrix
+        R = cam.R if isinstance(cam.R, np.ndarray) else cam.R.cpu().numpy()
+        # Camera looks along -Z in camera space
+        forward = -R[2, :]
+        look_dirs.append(forward)
+
+    positions = np.array(positions)
+    look_dirs = np.array(look_dirs)
+
+    cam_center = positions.mean(axis=0)
+    avg_look = look_dirs.mean(axis=0)
+    avg_look = avg_look / (np.linalg.norm(avg_look) + 1e-8)
+
+    # Scene center = camera center + distance along average gaze
+    scene_center = cam_center + avg_look * distance
+
+    return scene_center
