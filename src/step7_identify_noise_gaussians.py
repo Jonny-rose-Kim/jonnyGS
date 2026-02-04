@@ -55,7 +55,7 @@ from src.utils.camera_interpolation import (
     interpolate_cameras, find_adjacent_camera_pairs,
     interpolate_cameras_look_at, compute_scene_center_robust,
     compute_scene_center_from_cameras, compute_scene_center_from_gaze,
-    estimate_scene_up_vector
+    estimate_scene_up_vector, interpolate_cameras_pairwise_lookat
 )
 from src.utils.camera_clustering import cluster_and_select_cameras, find_adjacent_pairs_in_cluster, extract_camera_positions
 from src.utils.ray_gaussian_intersection import find_intersecting_gaussians, find_visible_gaussians
@@ -176,7 +176,7 @@ def find_nearest_neighbor_pairs(cluster):
 
 def create_cluster_novel_views(cluster, max_views_per_cluster=None, num_interpolations=5,
                                 scene_center=None, use_look_at=True, arc_interpolation=True,
-                                world_up=None):
+                                world_up=None, pairwise_lookat=False):
     """
     클러스터 내에서 novel view 생성
     각 카메라 쌍에서 균등한 간격으로 여러 개의 novel view 생성
@@ -188,10 +188,11 @@ def create_cluster_novel_views(cluster, max_views_per_cluster=None, num_interpol
         cluster: 카메라 리스트
         max_views_per_cluster: 최대 novel view 수 (None이면 제한 없음)
         num_interpolations: 각 쌍에서 생성할 novel view 수 (기본값 5)
-        scene_center: Scene 중심점 [3] (None이면 기존 방식 사용)
+        scene_center: Scene 중심점 [3] (None이면 기존 방식 사용, pairwise_lookat=True면 무시됨)
         use_look_at: True면 scene_center를 바라보는 look-at 보간 사용
         arc_interpolation: True면 scene 주위를 도는 arc 경로 사용
         world_up: Scene의 world up vector [3] (모든 카메라에서 추정됨)
+        pairwise_lookat: True면 각 카메라 쌍의 시선 교차점을 바라보도록 보간
 
     Returns:
         novel_views: List[(interp_cam, cam1, cam2, t)]
@@ -206,7 +207,14 @@ def create_cluster_novel_views(cluster, max_views_per_cluster=None, num_interpol
         for i in range(num_interpolations):
             t = (i + 1) / (num_interpolations + 1)
 
-            if scene_center is not None and use_look_at:
+            if pairwise_lookat:
+                # 카메라 쌍의 시선 교차점을 바라보는 보간
+                interp_cam = interpolate_cameras_pairwise_lookat(
+                    cam1, cam2, t=t,
+                    arc_interpolation=arc_interpolation,
+                    world_up=world_up
+                )
+            elif scene_center is not None and use_look_at:
                 # Look-at 기반 보간: 항상 scene center를 바라봄
                 interp_cam = interpolate_cameras_look_at(
                     cam1, cam2, scene_center, t=t,
@@ -463,6 +471,8 @@ def main():
                        help='Use linear interpolation instead of arc')
     parser.add_argument('--min_valid_ratio', type=float, default=0.1,
                        help='Minimum valid pixel ratio (skip views with too much black)')
+    parser.add_argument('--pairwise_lookat', action='store_true', default=False,
+                       help='Use pairwise gaze intersection as look-at target (instead of global scene center)')
 
     # Scene center 계산 방식
     parser.add_argument('--scene_center_method', type=str, default='camera',
@@ -511,9 +521,10 @@ def main():
     print(f"Vote threshold (per cluster): {args.vote_threshold}")
     print(f"Mahalanobis threshold: {args.mahalanobis_threshold}")
     print(f"Look-at interpolation: {args.use_look_at}")
+    print(f"Pairwise look-at: {args.pairwise_lookat}")
     print(f"Arc interpolation: {args.arc_interpolation}")
     print(f"Min valid pixel ratio: {args.min_valid_ratio}")
-    print(f"Scene center method: {args.scene_center_method}")
+    print(f"Scene center method: {args.scene_center_method} {'(ignored, using pairwise)' if args.pairwise_lookat else ''}")
     if args.scene_center:
         print(f"Scene center override: {args.scene_center}")
     print("=" * 80 + "\n")
@@ -643,7 +654,8 @@ def main():
                 scene_center=scene_center,
                 use_look_at=args.use_look_at,
                 arc_interpolation=args.arc_interpolation,
-                world_up=world_up
+                world_up=world_up,
+                pairwise_lookat=args.pairwise_lookat
             )
 
             skipped_views = 0
@@ -809,6 +821,7 @@ def main():
             'vote_threshold': args.vote_threshold,
             'min_opacity': args.min_opacity,
             'use_look_at': args.use_look_at,
+            'pairwise_lookat': args.pairwise_lookat,
             'arc_interpolation': args.arc_interpolation,
             'min_valid_ratio': args.min_valid_ratio,
             'scene_center_method': args.scene_center_method,

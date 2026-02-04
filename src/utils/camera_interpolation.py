@@ -568,3 +568,185 @@ def compute_scene_center_from_gaze(cameras, distance=2.0):
     scene_center = cam_center + avg_look * distance
 
     return scene_center
+
+
+def compute_gaze_intersection(cam1, cam2):
+    """
+    두 카메라의 시선(gaze) 방향의 교차점 또는 최근접점을 계산합니다.
+
+    두 3D 직선이 정확히 교차하지 않을 수 있으므로,
+    두 직선의 최근접점(closest points)의 중점을 반환합니다.
+
+    Args:
+        cam1: 첫 번째 카메라
+        cam2: 두 번째 카메라
+
+    Returns:
+        intersection: 교차점/최근접점의 중점 [3] numpy array
+        distance: 두 직선 사이의 최소 거리 (교차하면 0에 가까움)
+    """
+    # 카메라 위치 추출
+    if isinstance(cam1.camera_center, torch.Tensor):
+        P1 = cam1.camera_center.cpu().numpy()
+        P2 = cam2.camera_center.cpu().numpy()
+    else:
+        P1 = np.array(cam1.camera_center)
+        P2 = np.array(cam2.camera_center)
+
+    # 시선 방향 추출 (카메라는 -Z 방향을 바라봄)
+    R1 = cam1.R if isinstance(cam1.R, np.ndarray) else cam1.R.cpu().numpy()
+    R2 = cam2.R if isinstance(cam2.R, np.ndarray) else cam2.R.cpu().numpy()
+
+    D1 = -R1[2, :]  # -Z direction in world space
+    D2 = -R2[2, :]  # -Z direction in world space
+
+    # Normalize
+    D1 = D1 / (np.linalg.norm(D1) + 1e-8)
+    D2 = D2 / (np.linalg.norm(D2) + 1e-8)
+
+    # 두 직선의 최근접점 계산
+    # Ray1: P1 + t1 * D1
+    # Ray2: P2 + t2 * D2
+    # 최근접점을 찾기 위해 선형 시스템 풀기:
+    # (P1 + t1*D1 - P2 - t2*D2) · D1 = 0
+    # (P1 + t1*D1 - P2 - t2*D2) · D2 = 0
+
+    # w = P1 - P2
+    w = P1 - P2
+
+    a = np.dot(D1, D1)  # always >= 0
+    b = np.dot(D1, D2)
+    c = np.dot(D2, D2)  # always >= 0
+    d = np.dot(D1, w)
+    e = np.dot(D2, w)
+
+    denom = a * c - b * b
+
+    if abs(denom) < 1e-8:
+        # 두 직선이 평행함 - 중점 방향으로 적당한 거리에 교차점 설정
+        t1 = 0.0
+        t2 = d / b if abs(b) > 1e-8 else 0.0
+    else:
+        t1 = (b * e - c * d) / denom
+        t2 = (a * e - b * d) / denom
+
+    # 카메라 앞쪽만 유효 (t > 0)
+    t1 = max(t1, 0.1)  # 최소 거리 확보
+    t2 = max(t2, 0.1)
+
+    # 두 직선 위의 최근접점
+    closest1 = P1 + t1 * D1
+    closest2 = P2 + t2 * D2
+
+    # 최근접점의 중점 = 교차점
+    intersection = (closest1 + closest2) / 2.0
+
+    # 두 직선 사이의 거리
+    distance = np.linalg.norm(closest1 - closest2)
+
+    return intersection, distance
+
+
+def interpolate_cameras_pairwise_lookat(cam1, cam2, t=0.5, arc_interpolation=True, world_up=None):
+    """
+    두 카메라의 시선 교차점을 바라보도록 보간합니다.
+
+    기존 interpolate_cameras_look_at과 달리, 전역 scene_center가 아닌
+    각 카메라 쌍의 시선 교차점을 look-at target으로 사용합니다.
+
+    Args:
+        cam1: 첫 번째 카메라
+        cam2: 두 번째 카메라
+        t: 보간 파라미터 [0, 1]
+        arc_interpolation: True면 교차점 주위를 도는 arc 경로 사용
+        world_up: Scene의 world up vector [3]
+
+    Returns:
+        보간된 카메라 객체 (시선 교차점을 바라봄)
+    """
+    import copy
+
+    # 두 카메라의 시선 교차점 계산
+    look_at_target, dist = compute_gaze_intersection(cam1, cam2)
+
+    # 카메라 위치 추출
+    if isinstance(cam1.camera_center, torch.Tensor):
+        pos1 = cam1.camera_center.cpu().numpy()
+        pos2 = cam2.camera_center.cpu().numpy()
+    else:
+        pos1 = np.array(cam1.camera_center)
+        pos2 = np.array(cam2.camera_center)
+
+    # Use provided world_up or default to Y-down
+    if world_up is None:
+        world_up = np.array([0, -1, 0])
+    else:
+        world_up = np.array(world_up)
+
+    if arc_interpolation:
+        # Arc interpolation: look_at_target 주위를 도는 호 경로
+        v1 = pos1 - look_at_target
+        v2 = pos2 - look_at_target
+
+        r1 = np.linalg.norm(v1)
+        r2 = np.linalg.norm(v2)
+
+        if r1 < 1e-6 or r2 < 1e-6:
+            pos_interp = (1 - t) * pos1 + t * pos2
+        else:
+            d1 = v1 / r1
+            d2 = v2 / r2
+
+            r_interp = (1 - t) * r1 + t * r2
+
+            dot = np.dot(d1, d2)
+            dot = np.clip(dot, -1.0, 1.0)
+
+            if abs(dot) > 0.9999:
+                d_interp = (1 - t) * d1 + t * d2
+            else:
+                theta = np.arccos(dot)
+                sin_theta = np.sin(theta)
+                w1 = np.sin((1 - t) * theta) / sin_theta
+                w2 = np.sin(t * theta) / sin_theta
+                d_interp = w1 * d1 + w2 * d2
+
+            d_interp = d_interp / (np.linalg.norm(d_interp) + 1e-8)
+            pos_interp = look_at_target + r_interp * d_interp
+    else:
+        pos_interp = (1 - t) * pos1 + t * pos2
+
+    # 교차점을 바라보는 rotation 계산
+    R_interp = compute_look_at_rotation(pos_interp, look_at_target, up=world_up)
+
+    # 카메라 복사 및 업데이트
+    interp_cam = copy.copy(cam1)
+
+    T_interp = -R_interp @ pos_interp
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    interp_cam.R = R_interp
+    interp_cam.T = T_interp
+    interp_cam.camera_center = torch.tensor(pos_interp, dtype=torch.float32, device=device)
+
+    interp_cam.uid = -1
+    interp_cam.colmap_id = -1
+    interp_cam.image_name = f"pairwise_{cam1.image_name}_{cam2.image_name}_{t:.2f}"
+
+    # Transform 업데이트
+    interp_cam.world_view_transform = torch.tensor(
+        getWorld2View2(R_interp, T_interp), dtype=torch.float32
+    ).transpose(0, 1).cuda()
+    interp_cam.projection_matrix = getProjectionMatrix(
+        znear=interp_cam.znear,
+        zfar=interp_cam.zfar,
+        fovX=interp_cam.FoVx,
+        fovY=interp_cam.FoVy
+    ).transpose(0, 1).cuda()
+    interp_cam.full_proj_transform = (
+        interp_cam.world_view_transform.unsqueeze(0).bmm(
+            interp_cam.projection_matrix.unsqueeze(0)
+        )
+    ).squeeze(0)
+
+    return interp_cam
