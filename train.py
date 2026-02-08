@@ -54,6 +54,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if load_ply:
         print(f"Loading Gaussians from PLY: {load_ply}")
         gaussians.load_ply(load_ply, dataset.train_test_exp)
+        # Reinitialize max_radii2D to match new gaussian count
+        gaussians.max_radii2D = torch.zeros((gaussians.get_xyz.shape[0]), device="cuda")
         print(f"Loaded {gaussians.get_xyz.shape[0]} Gaussians from PLY")
 
     gaussians.training_setup(opt)
