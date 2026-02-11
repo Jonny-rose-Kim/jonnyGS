@@ -176,7 +176,7 @@ def find_nearest_neighbor_pairs(cluster):
 
 def create_cluster_novel_views(cluster, max_views_per_cluster=None, num_interpolations=5,
                                 scene_center=None, use_look_at=True, arc_interpolation=True,
-                                world_up=None, pairwise_lookat=False):
+                                world_up=None, pairwise_lookat=False, max_pairs=None):
     """
     클러스터 내에서 novel view 생성
     각 카메라 쌍에서 균등한 간격으로 여러 개의 novel view 생성
@@ -193,12 +193,17 @@ def create_cluster_novel_views(cluster, max_views_per_cluster=None, num_interpol
         arc_interpolation: True면 scene 주위를 도는 arc 경로 사용
         world_up: Scene의 world up vector [3] (모든 카메라에서 추정됨)
         pairwise_lookat: True면 각 카메라 쌍의 시선 교차점을 바라보도록 보간
+        max_pairs: None이면 nearest-neighbor 쌍만, 값이면 거리순 상위 K개 all-pairs 사용
 
     Returns:
         novel_views: List[(interp_cam, cam1, cam2, t)]
     """
-    # 각 카메라의 최근접 이웃 쌍 찾기
-    pairs = find_nearest_neighbor_pairs(cluster)
+    if max_pairs is not None:
+        # All-pairs 모드: 거리순 상위 max_pairs개 쌍 사용 (nC2 중 선택)
+        pairs = find_adjacent_pairs_in_cluster(cluster, max_pairs=max_pairs)
+    else:
+        # 기존 방식: 각 카메라의 최근접 이웃 1:1 매칭
+        pairs = find_nearest_neighbor_pairs(cluster)
 
     novel_views = []
     for cam1, cam2, dist in pairs:
@@ -490,13 +495,22 @@ def main():
     # Ray-Gaussian intersection 파라미터
     parser.add_argument('--mahalanobis_threshold', type=float, default=3.0,
                        help='Mahalanobis distance threshold')
-    parser.add_argument('--sample_ratio', type=float, default=0.1,
+    parser.add_argument('--sample_ratio', type=float, default=0.8,
                        help='Mask pixel sampling ratio (1.0 = all)')
     parser.add_argument('--min_opacity', type=float, default=0.01,
                        help='Minimum gaussian opacity')
+    parser.add_argument('--max_rays', type=int, default=None,
+                       help='Maximum rays per view (None = no limit)')
+    parser.add_argument('--high_confidence_threshold', type=float, default=0.8,
+                       help='Pixels above this confidence are always included in sampling')
+
+    # 카메라 쌍 생성 방식
+    parser.add_argument('--max_pairs', type=int, default=None,
+                       help='Max camera pairs per cluster (None=nearest-neighbor only, '
+                            'set value to use top-K closest all-pairs, e.g. 50)')
 
     # 투표 파라미터
-    parser.add_argument('--vote_threshold', type=float, default=0.5,
+    parser.add_argument('--vote_threshold', type=float, default=0.3,
                        help='Vote threshold for noise classification (per cluster)')
 
     # 기타
@@ -520,6 +534,11 @@ def main():
     print(f"Interpolations per pair: {args.num_interpolations}")
     print(f"Vote threshold (per cluster): {args.vote_threshold}")
     print(f"Mahalanobis threshold: {args.mahalanobis_threshold}")
+    print(f"Sample ratio: {args.sample_ratio}")
+    print(f"Max rays per view: {args.max_rays if args.max_rays else 'unlimited'}")
+    print(f"High confidence threshold: {args.high_confidence_threshold}")
+    max_pairs_str = str(args.max_pairs) + " closest pairs (all-pairs mode)" if args.max_pairs else "nearest-neighbor only"
+    print(f"Camera pairs per cluster: {max_pairs_str}")
     print(f"Look-at interpolation: {args.use_look_at}")
     print(f"Pairwise look-at: {args.pairwise_lookat}")
     print(f"Arc interpolation: {args.arc_interpolation}")
@@ -625,7 +644,12 @@ def main():
 
     # total_views 계산: 각 클러스터의 쌍 수 * num_interpolations
     def estimate_views_for_cluster(cluster_size):
-        num_pairs = cluster_size // 2  # 각 카메라는 한 번만 사용
+        if args.max_pairs is not None:
+            # all-pairs 모드: nC2 중 상위 max_pairs개
+            n_all_pairs = cluster_size * (cluster_size - 1) // 2
+            num_pairs = min(n_all_pairs, args.max_pairs)
+        else:
+            num_pairs = cluster_size // 2  # 각 카메라는 한 번만 사용
         num_views = num_pairs * args.num_interpolations
         if args.views_per_cluster is not None:
             num_views = min(num_views, args.views_per_cluster)
@@ -655,7 +679,8 @@ def main():
                 use_look_at=args.use_look_at,
                 arc_interpolation=args.arc_interpolation,
                 world_up=world_up,
-                pairwise_lookat=args.pairwise_lookat
+                pairwise_lookat=args.pairwise_lookat,
+                max_pairs=args.max_pairs
             )
 
             skipped_views = 0
@@ -704,7 +729,9 @@ def main():
                     threshold=args.mahalanobis_threshold,
                     sample_ratio=args.sample_ratio,
                     min_opacity=args.min_opacity,
-                    verbose=False
+                    verbose=False,
+                    max_rays=args.max_rays,
+                    high_confidence_threshold=args.high_confidence_threshold
                 )
 
                 # 가시 가우시안

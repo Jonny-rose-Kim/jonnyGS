@@ -257,25 +257,27 @@ def find_intersecting_gaussians(
     mask: torch.Tensor,
     gaussians,
     threshold: float = 3.0,
-    sample_ratio: float = 1.0,
+    sample_ratio: float = 0.8,
     min_opacity: float = 0.01,
     verbose: bool = True,
-    max_rays: int = 500,
-    distance_prefilter: float = 5.0
+    max_rays: int = None,
+    distance_prefilter: float = 5.0,
+    high_confidence_threshold: float = 0.8
 ) -> Set[int]:
     """
     마스크 영역의 픽셀들에 대해 교차하는 가우시안 찾기 (메모리 효율적)
 
     Args:
         camera: 카메라 객체
-        mask: 2D 노이즈 마스크 [H, W] 또는 [1, H, W]
+        mask: 2D 노이즈 마스크 [H, W] 또는 [1, H, W] (0~1 float)
         gaussians: GaussianModel 객체
         threshold: 마할라노비스 거리 임계값
         sample_ratio: 마스크 픽셀 샘플링 비율 (1.0 = 전체)
         min_opacity: 최소 불투명도 (낮은 불투명도 가우시안 무시)
         verbose: 진행 상황 출력
-        max_rays: 최대 광선 수 (메모리 제한)
+        max_rays: 최대 광선 수 (None = 제한 없음)
         distance_prefilter: 유클리드 거리 사전 필터링 임계값
+        high_confidence_threshold: 이 값 이상의 고신뢰 픽셀은 항상 포함
 
     Returns:
         noise_candidates: 노이즈 후보 가우시안 인덱스 집합
@@ -289,26 +291,48 @@ def find_intersecting_gaussians(
         mask = mask.squeeze(0)
     mask = mask.to(device)
 
-    # 마스크에서 흰색 픽셀 좌표 추출
-    white_pixels = torch.where(mask > 0.5)
-    v_coords, u_coords = white_pixels[0], white_pixels[1]
+    # 고신뢰 픽셀 (항상 포함) + 일반 노이즈 픽셀 분리
+    high_conf_pixels = torch.where(mask >= high_confidence_threshold)
+    normal_noise_pixels = torch.where((mask > 0.5) & (mask < high_confidence_threshold))
 
-    if len(u_coords) == 0:
+    hc_v, hc_u = high_conf_pixels[0], high_conf_pixels[1]
+    nn_v, nn_u = normal_noise_pixels[0], normal_noise_pixels[1]
+
+    n_high_conf = len(hc_u)
+    n_normal = len(nn_u)
+    n_total_noise = n_high_conf + n_normal
+
+    if n_total_noise == 0:
         if verbose:
             print("  마스크에 노이즈 픽셀 없음")
         return set()
 
-    # 샘플링 - 더 공격적으로
-    n_pixels = len(u_coords)
-    n_samples = min(max_rays, max(1, int(n_pixels * sample_ratio)))
+    # 고신뢰 픽셀은 100% 포함, 나머지에서 sample_ratio만큼 샘플링
+    if n_normal > 0 and sample_ratio < 1.0:
+        n_normal_samples = max(1, int(n_normal * sample_ratio))
+        indices = torch.randperm(n_normal, device=device)[:n_normal_samples]
+        nn_u = nn_u[indices]
+        nn_v = nn_v[indices]
 
-    if n_samples < n_pixels:
-        indices = torch.randperm(n_pixels, device=device)[:n_samples]
-        u_coords = u_coords[indices]
-        v_coords = v_coords[indices]
+    # 합치기
+    u_coords = torch.cat([hc_u, nn_u]) if n_high_conf > 0 else nn_u
+    v_coords = torch.cat([hc_v, nn_v]) if n_high_conf > 0 else nn_v
+
+    # max_rays 제한 적용 (설정된 경우에만)
+    if max_rays is not None and len(u_coords) > max_rays:
+        # 고신뢰 픽셀은 유지하면서 제한
+        if n_high_conf >= max_rays:
+            indices = torch.randperm(n_high_conf, device=device)[:max_rays]
+            u_coords = hc_u[indices]
+            v_coords = hc_v[indices]
+        else:
+            remaining = max_rays - n_high_conf
+            normal_indices = torch.randperm(len(nn_u), device=device)[:remaining]
+            u_coords = torch.cat([hc_u, nn_u[normal_indices]])
+            v_coords = torch.cat([hc_v, nn_v[normal_indices]])
 
     if verbose:
-        print(f"  노이즈 픽셀: {n_pixels} → 샘플링: {len(u_coords)}")
+        print(f"  노이즈 픽셀: {n_total_noise} (고신뢰: {n_high_conf}) → 샘플링: {len(u_coords)}")
 
     # 픽셀 -> 광선 변환
     ray_origins, ray_dirs = pixel_to_ray(u_coords, v_coords, camera)
