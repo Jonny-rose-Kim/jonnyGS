@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Step 7: 3D Noise Gaussian Identification (클러스터별 투표 방식)
+Step 7: 3D Noise Gaussian Identification (카메라 쌍 레벨 투표 방식)
 
 2D 노이즈 마스크를 3D 공간의 노이즈 가우시안으로 역투영합니다.
 
@@ -10,8 +10,8 @@ Step 7: 3D Noise Gaussian Identification (클러스터별 투표 방식)
 3. 클러스터 내 novel view 생성 및 렌더링
 4. 노이즈 마스크 생성 (학습된 detector 사용)
 5. Ray-Gaussian intersection으로 노이즈 후보 추출
-6. **클러스터별** 투표로 노이즈 가우시안 결정
-7. 클러스터별 + Union 결과 저장
+6. **카메라 쌍 레벨** 투표로 노이즈 가우시안 결정 (쌍 내 일관성 필터링)
+7. 클러스터별 union + 전체 Union 결과 저장
 8. 카메라 클러스터 시각화
 
 입력:
@@ -40,7 +40,7 @@ import argparse
 import json
 import numpy as np
 from tqdm import tqdm
-from collections import Counter
+from collections import Counter, defaultdict
 import torchvision
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
@@ -370,6 +370,48 @@ def compute_noise_gaussians_voting(
     return noise_gaussians
 
 
+def compute_pair_noise_voting(
+    pair_view_candidates: list,
+    pair_visible_gaussians: list,
+    vote_threshold: float = 0.7
+) -> set:
+    """
+    카메라 쌍 내 투표 기반 노이즈 가우시안 결정
+
+    같은 카메라 쌍에서 생성된 여러 novel view들 사이에서
+    vote_threshold 이상 검출된 가우시안만 후보로 채택.
+
+    예: num_interpolations=5, vote_threshold=0.7 → 5개 중 4개 이상에서 검출되어야 통과
+
+    Args:
+        pair_view_candidates: List[Set[int]] - 쌍 내 각 뷰별 노이즈 후보 인덱스
+        pair_visible_gaussians: List[Set[int]] - 쌍 내 각 뷰별 가시 가우시안 인덱스
+        vote_threshold: 쌍 내 투표 임계값 (0.7 = 70%)
+
+    Returns:
+        pair_noise_gaussians: 쌍 레벨 필터링된 노이즈 가우시안 집합
+    """
+    if not pair_view_candidates:
+        return set()
+
+    vote_count = Counter()
+    visible_count = Counter()
+
+    for candidates, visible in zip(pair_view_candidates, pair_visible_gaussians):
+        for g_idx in candidates:
+            vote_count[g_idx] += 1
+        for g_idx in visible:
+            visible_count[g_idx] += 1
+
+    pair_noise = set()
+    for g_idx, votes in vote_count.items():
+        visible_views = visible_count.get(g_idx, 1)
+        if votes / visible_views >= vote_threshold:
+            pair_noise.add(g_idx)
+
+    return pair_noise
+
+
 def save_noise_gaussians_ply(gaussians, noise_indices, output_path, save_noise=True):
     """
     노이즈 또는 클린 가우시안을 PLY로 저장
@@ -510,8 +552,11 @@ def main():
                             'set value to use top-K closest all-pairs, e.g. 50)')
 
     # 투표 파라미터
-    parser.add_argument('--vote_threshold', type=float, default=0.3,
-                       help='Vote threshold for noise classification (per cluster)')
+    parser.add_argument('--vote_threshold', type=float, default=0.7,
+                       help='Vote threshold for noise classification (per camera pair). '
+                            'A gaussian must be detected in this fraction of views within '
+                            'the same camera pair to be classified as noise. '
+                            'e.g., 0.7 with 5 interpolations = 4/5 views required.')
 
     # 기타
     parser.add_argument('--image_size', type=int, default=256,
@@ -532,7 +577,7 @@ def main():
     views_str = "no limit" if args.views_per_cluster is None else args.views_per_cluster
     print(f"Max views per cluster: {views_str}")
     print(f"Interpolations per pair: {args.num_interpolations}")
-    print(f"Vote threshold (per cluster): {args.vote_threshold}")
+    print(f"Vote threshold (per camera pair): {args.vote_threshold}")
     print(f"Mahalanobis threshold: {args.mahalanobis_threshold}")
     print(f"Sample ratio: {args.sample_ratio}")
     print(f"Max rays per view: {args.max_rays if args.max_rays else 'unlimited'}")
@@ -665,9 +710,9 @@ def main():
             cluster_dir = output_dir / f"cluster_{cluster_idx}"
             cluster_dir.mkdir(exist_ok=True)
 
-            # 클러스터 내 후보 수집
-            cluster_view_candidates = []
-            cluster_visible_gaussians = []
+            # 클러스터 내 후보 수집 (카메라 쌍별 그룹화)
+            pair_candidates = defaultdict(list)    # pair_key -> [Set[int], ...]
+            pair_visible = defaultdict(list)       # pair_key -> [Set[int], ...]
             cluster_view_metadata = []
 
             # 클러스터 내 novel view 생성 (look-at 기반)
@@ -737,8 +782,10 @@ def main():
                 # 가시 가우시안
                 visible = find_visible_gaussians(interp_cam, gaussians, args.min_opacity)
 
-                cluster_view_candidates.append(candidates)
-                cluster_visible_gaussians.append(visible)
+                # 카메라 쌍별로 그룹화
+                pair_key = (cam1.image_name, cam2.image_name)
+                pair_candidates[pair_key].append(candidates)
+                pair_visible[pair_key].append(visible)
 
                 cluster_view_metadata.append({
                     'view_idx': view_idx,
@@ -756,13 +803,40 @@ def main():
             if skipped_views > 0:
                 print(f"    Skipped {skipped_views} views with too much black (< {args.min_valid_ratio*100:.0f}% valid pixels)")
 
-            # 클러스터별 투표 (유효한 뷰가 있을 때만)
-            print(f"    Computing noise gaussians for cluster {cluster_idx}...")
-            cluster_noise_gaussians = compute_noise_gaussians_voting(
-                cluster_view_candidates,
-                cluster_visible_gaussians,
-                vote_threshold=args.vote_threshold
-            )
+            # 카메라 쌍 레벨 투표 → 클러스터 내 union
+            print(f"    Pair-level voting for cluster {cluster_idx} ({len(pair_candidates)} pairs, threshold={args.vote_threshold})...")
+            cluster_noise_gaussians = set()
+            pair_results_list = []
+
+            for pair_key, cands_list in pair_candidates.items():
+                vis_list = pair_visible[pair_key]
+                pair_noise = compute_pair_noise_voting(
+                    cands_list, vis_list,
+                    vote_threshold=args.vote_threshold
+                )
+                cluster_noise_gaussians.update(pair_noise)
+
+                # 쌍별 raw 후보 수 (투표 전)
+                raw_candidates = set()
+                for c in cands_list:
+                    raw_candidates.update(c)
+
+                pair_results_list.append({
+                    'cam1': pair_key[0],
+                    'cam2': pair_key[1],
+                    'num_views': len(cands_list),
+                    'raw_candidates': len(raw_candidates),
+                    'after_vote': len(pair_noise),
+                    'filtered_out': len(raw_candidates) - len(pair_noise)
+                })
+
+                if len(pair_noise) > 0:
+                    print(f"      Pair ({pair_key[0]}, {pair_key[1]}): "
+                          f"{len(raw_candidates)} raw → {len(pair_noise)} after vote "
+                          f"({len(cands_list)} views)")
+
+            total_raw = sum(p['raw_candidates'] for p in pair_results_list)
+            print(f"    Pair voting summary: {total_raw} raw candidates → {len(cluster_noise_gaussians)} after pair-level vote")
 
             cluster_noise_ratio = len(cluster_noise_gaussians) / total_gaussians if total_gaussians > 0 else 0
             print(f"    Cluster {cluster_idx}: {len(cluster_noise_gaussians)} noise gaussians ({cluster_noise_ratio*100:.2f}%)")
@@ -787,6 +861,7 @@ def main():
             cluster_results.append({
                 'cluster_idx': cluster_idx,
                 'num_cameras': len(cluster),
+                'num_pairs': len(pair_candidates),
                 'num_views': len(novel_views),
                 'num_valid_views': len(novel_views) - skipped_views,
                 'num_skipped_views': skipped_views,
@@ -794,6 +869,7 @@ def main():
                 'noise_gaussians_count': len(cluster_noise_gaussians),
                 'noise_ratio': cluster_noise_ratio,
                 'noise_gaussian_indices': sorted(list(cluster_noise_gaussians)),
+                'pair_voting_results': pair_results_list,
                 'view_metadata': cluster_view_metadata
             })
 
@@ -843,9 +919,14 @@ def main():
             'n_clusters': args.n_clusters,
             'top_k_clusters': args.top_k_clusters,
             'views_per_cluster': args.views_per_cluster,
+            'num_interpolations': args.num_interpolations,
             'mahalanobis_threshold': args.mahalanobis_threshold,
             'sample_ratio': args.sample_ratio,
             'vote_threshold': args.vote_threshold,
+            'vote_level': 'per_camera_pair',
+            'max_rays': args.max_rays,
+            'max_pairs': args.max_pairs,
+            'high_confidence_threshold': args.high_confidence_threshold,
             'min_opacity': args.min_opacity,
             'use_look_at': args.use_look_at,
             'pairwise_lookat': args.pairwise_lookat,
