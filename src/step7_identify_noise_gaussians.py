@@ -566,6 +566,11 @@ def main():
     parser.add_argument('--save_visualization', action='store_true',
                        help='Save visualization images')
 
+    # Resume 기능
+    parser.add_argument('--start_cluster', type=int, default=0,
+                       help='Resume from this cluster index (skip already processed clusters). '
+                            'Loads existing results from cluster_0..cluster_{N-1} directories.')
+
     args = parser.parse_args()
 
     print("=" * 80)
@@ -702,8 +707,64 @@ def main():
 
     total_views = sum(estimate_views_for_cluster(len(c)) for c in clusters)
 
-    with tqdm(total=total_views, desc="Processing views") as pbar:
+    # Resume: 이미 처리된 클러스터 결과 로드
+    if args.start_cluster > 0:
+        print(f"\n  Resuming from cluster {args.start_cluster} (loading clusters 0-{args.start_cluster - 1} from disk)...")
+        skipped_views_total = 0
+        for skip_idx in range(args.start_cluster):
+            cluster_dir = output_dir / f"cluster_{skip_idx}"
+            noise_ply_path = cluster_dir / "noise_gaussians.ply"
+
+            if not noise_ply_path.exists():
+                print(f"    WARNING: cluster_{skip_idx}/noise_gaussians.ply not found, skipping")
+                continue
+
+            # PLY에서 noise gaussian indices 복원
+            from plyfile import PlyData
+            plydata = PlyData.read(str(noise_ply_path))
+            noise_xyz = np.stack([
+                np.array(plydata.elements[0]['x']),
+                np.array(plydata.elements[0]['y']),
+                np.array(plydata.elements[0]['z'])
+            ], axis=1)  # [N_noise, 3]
+
+            # 원본 가우시안과 매칭하여 인덱스 복원
+            all_xyz = gaussians.get_xyz.detach().cpu().numpy()  # [N_total, 3]
+            cluster_noise_indices = set()
+            if len(noise_xyz) > 0:
+                # KD-tree로 빠르게 매칭
+                from scipy.spatial import cKDTree
+                tree = cKDTree(all_xyz)
+                _, indices = tree.query(noise_xyz, k=1)
+                cluster_noise_indices = set(indices.tolist())
+
+            union_noise_gaussians.update(cluster_noise_indices)
+            cluster_noise_ratio = len(cluster_noise_indices) / total_gaussians if total_gaussians > 0 else 0
+            print(f"    Loaded cluster {skip_idx}: {len(cluster_noise_indices)} noise gaussians ({cluster_noise_ratio*100:.2f}%)")
+
+            cluster_results.append({
+                'cluster_idx': skip_idx,
+                'num_cameras': len(clusters[skip_idx]),
+                'noise_gaussians_count': len(cluster_noise_indices),
+                'noise_ratio': cluster_noise_ratio,
+                'noise_gaussian_indices': sorted(list(cluster_noise_indices)),
+                'resumed_from_disk': True
+            })
+
+            skipped_views_total += estimate_views_for_cluster(len(clusters[skip_idx]))
+
+        print(f"  Loaded {args.start_cluster} clusters, {len(union_noise_gaussians)} noise gaussians so far")
+        print(f"  Skipping {skipped_views_total} already-processed views\n")
+    else:
+        skipped_views_total = 0
+
+    remaining_views = total_views - skipped_views_total
+    with tqdm(total=remaining_views, desc="Processing views") as pbar:
         for cluster_idx, cluster in enumerate(clusters):
+            # 이미 처리된 클러스터 건너뛰기
+            if cluster_idx < args.start_cluster:
+                continue
+
             print(f"\n  Processing Cluster {cluster_idx} ({len(cluster)} cameras)...")
 
             # 클러스터별 출력 디렉토리
