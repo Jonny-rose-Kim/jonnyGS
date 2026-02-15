@@ -215,17 +215,22 @@ class NoiseDataLoader:
 
         noise_pos = noise_pos.to(xyz.device)
 
-        # Chunk-based distance computation to avoid OOM for large point clouds
+        # Double-chunked distance computation to avoid OOM
+        # xyz: [N, 3] (4M+), noise_pos: [M, 3] (24K+)
         N = xyz.shape[0]
         M = noise_pos.shape[0]
         mask = torch.zeros(N, dtype=torch.bool, device=xyz.device)
 
-        chunk_size = 4096
-        for i in range(0, M, chunk_size):
-            chunk = noise_pos[i:i + chunk_size]  # [chunk, 3]
-            # [N, 1, 3] - [1, chunk, 3] → [N, chunk]
-            dists = torch.cdist(xyz.unsqueeze(0), chunk.unsqueeze(0)).squeeze(0)  # [N, chunk]
-            mask |= (dists.min(dim=1).values < radius)
+        noise_chunk_size = 2048   # noise positions per chunk
+        xyz_chunk_size = 100000   # gaussians per chunk
+
+        for i in range(0, N, xyz_chunk_size):
+            xyz_chunk = xyz[i:i + xyz_chunk_size]  # [xyz_cs, 3]
+            for j in range(0, M, noise_chunk_size):
+                noise_chunk = noise_pos[j:j + noise_chunk_size]  # [noise_cs, 3]
+                dists = torch.cdist(xyz_chunk.unsqueeze(0), noise_chunk.unsqueeze(0)).squeeze(0)
+                mask[i:i + xyz_chunk_size] |= (dists.min(dim=1).values < radius)
+                del dists
 
         return mask
 
