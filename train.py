@@ -40,7 +40,7 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, load_ply=None):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, load_ply=None, noise_data_dir=None, noise_loss_weight=0.7):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -62,6 +62,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
+
+    # Noise-aware training setup
+    noise_loader = None
+    if noise_data_dir:
+        from src.utils.noise_loader import NoiseDataLoader
+        noise_loader = NoiseDataLoader(noise_data_dir, device="cuda")
+        print(f"[NOISE] Noise-aware training enabled (loss_weight={noise_loss_weight})")
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -126,9 +133,37 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
+
+        # Noise-aware loss: weight noise pixels less in L1, use weighted SSIM
+        noise_mask = None
+        ssim_weight = None
+        if noise_loader is not None:
+            render_hw = (image.shape[1], image.shape[2])
+            noise_mask = noise_loader.load_noise_mask_for_view(
+                viewpoint_cam.image_name, render_hw=render_hw
+            )
+            ssim_weight = noise_loader.load_ssim_weight_for_view(
+                viewpoint_cam.image_name, render_hw=render_hw
+            )
+
+        if noise_mask is not None:
+            noise_mask = noise_mask.to(image.device)
+            # L1: per-pixel weighting (w=1.0 for clean, w=noise_loss_weight for noise)
+            l1_weight_map = 1.0 - noise_mask * (1.0 - noise_loss_weight)
+            Ll1 = (torch.abs(image - gt_image) * l1_weight_map.unsqueeze(0)).mean()
+        else:
+            Ll1 = l1_loss(image, gt_image)
+
+        if ssim_weight is not None:
+            ssim_weight = ssim_weight.to(image.device)
+            # [H, W] -> [1, 1, H, W] for fused_ssim weight_map
+            ssim_weight_4d = ssim_weight.unsqueeze(0).unsqueeze(0)
+        else:
+            ssim_weight_4d = None
+
         if FUSED_SSIM_AVAILABLE:
-            ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+            ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0),
+                                    weight_map=ssim_weight_4d)
         else:
             ssim_value = ssim(image, gt_image)
 
@@ -278,6 +313,10 @@ if __name__ == "__main__":
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--load_ply", type=str, default=None,
                        help="Load Gaussians from existing PLY file instead of SfM initialization")
+    parser.add_argument("--noise_data_dir", type=str, default=None,
+                       help="Path to noise_gaussians/ directory for noise-aware training")
+    parser.add_argument("--noise_loss_weight", type=float, default=0.7,
+                       help="Loss weight for noise pixels (0.0=ignore, 1.0=normal, default=0.7)")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -290,7 +329,7 @@ if __name__ == "__main__":
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.load_ply)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.load_ply, args.noise_data_dir, args.noise_loss_weight)
 
     # All done
     print("\nTraining complete.")

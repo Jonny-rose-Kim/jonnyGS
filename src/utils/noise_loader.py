@@ -23,8 +23,11 @@ class NoiseDataLoader:
         clean_gaussians.ply    — clean Gaussian points
         cameras.json           — camera info with id-to-name mapping
 
+    Optional subdirectory:
+        contribution_masks/    — noise contribution maps (Step 9, priority 1)
+
     Optional sibling directories:
-        ../dataset_pairs/      — pre-computed 2D noise masks (Step 4)
+        ../dataset_pairs/      — pre-computed 2D noise masks (Step 4, priority 2)
         ../rendered_views/     — pre-rendered views (Step 3)
     """
 
@@ -61,9 +64,26 @@ class NoiseDataLoader:
             for cam in cameras:
                 self._cam_name_to_id[cam["img_name"]] = cam["id"]
 
-        # Locate dataset_pairs directory (sibling)
-        self._dataset_pairs_dir = self.noise_data_dir.parent / "dataset_pairs"
+        # Locate contribution_masks directory (Step 9, priority 1)
+        self._contribution_masks_dir = self.noise_data_dir / "contribution_masks"
         self._mask_cache = {}
+
+        # Build image_name -> mask path mapping for contribution masks
+        self._name_to_contribution_mask = {}
+        self._name_to_contribution_soft = {}
+        if self._contribution_masks_dir.exists():
+            for mask_file in self._contribution_masks_dir.glob("*.png"):
+                name = mask_file.stem
+                if name.endswith("_soft"):
+                    # soft weight map: {image_name}_soft.png
+                    base_name = name[:-5]  # remove "_soft"
+                    self._name_to_contribution_soft[base_name] = mask_file
+                elif name != "metadata":
+                    # binary mask: {image_name}.png
+                    self._name_to_contribution_mask[name] = mask_file
+
+        # Locate dataset_pairs directory (sibling, priority 2)
+        self._dataset_pairs_dir = self.noise_data_dir.parent / "dataset_pairs"
 
         # Build view_index to pair path mapping for pre-computed masks
         self._view_to_mask_path = {}
@@ -91,10 +111,16 @@ class NoiseDataLoader:
         self._cluster_vote_counts = self._compute_cluster_votes()
 
         # Log summary
-        n_masks = len(self._view_to_mask_path)
+        n_contribution = len(self._name_to_contribution_mask)
+        n_dataset_pairs = len(self._view_to_mask_path)
         print(f"[NOISE] Loaded {len(self._noise_indices)} noise indices "
               f"(total: {self._total_gaussians}, clean: {self._clean_count})")
-        print(f"[NOISE] Pre-computed 2D masks available for {n_masks} views")
+        if n_contribution > 0:
+            print(f"[NOISE] Contribution masks (Step 9): {n_contribution} views")
+        if n_dataset_pairs > 0:
+            print(f"[NOISE] Dataset pairs masks (Step 4): {n_dataset_pairs} views")
+        if n_contribution == 0 and n_dataset_pairs == 0:
+            print(f"[NOISE] WARNING: No 2D masks available")
         if detector_checkpoint:
             print(f"[NOISE] Detector checkpoint: {detector_checkpoint}")
 
@@ -116,6 +142,8 @@ class NoiseDataLoader:
         """
         Return 2D noise mask for a specific view.
 
+        Priority: contribution_masks (Step 9) > dataset_pairs (Step 4)
+
         Args:
             view_name: Camera image name (e.g., "_DSC9214.JPG")
             render_hw: (H, W) tuple for resizing mask to match render resolution
@@ -132,20 +160,73 @@ class NoiseDataLoader:
                 ).squeeze(0).squeeze(0)
             return mask
 
-        # Try pre-computed mask from dataset_pairs
-        view_id = self._cam_name_to_id.get(view_name)
-        if view_id is not None and view_id in self._view_to_mask_path:
-            mask_path = self._view_to_mask_path[view_id]
-            mask = self._load_mask_from_file(mask_path)
-            if render_hw and (mask.shape[0] != render_hw[0] or mask.shape[1] != render_hw[1]):
-                mask = torch.nn.functional.interpolate(
-                    mask.unsqueeze(0).unsqueeze(0), size=render_hw, mode="bilinear", align_corners=False
-                ).squeeze(0).squeeze(0)
-            self._mask_cache[view_name] = mask
-            return mask
+        mask = None
 
-        # No pre-computed mask available
-        return None
+        # Priority 1: Contribution masks (Step 9) — binary mask
+        # view_name may include extension (e.g., "_DSC9214.JPG")
+        # contribution mask filenames are stored without extension
+        base_name = Path(view_name).stem if "." in view_name else view_name
+        if base_name in self._name_to_contribution_mask:
+            mask_path = self._name_to_contribution_mask[base_name]
+            mask = self._load_mask_from_file(mask_path)
+
+        # Priority 2: Dataset pairs masks (Step 4)
+        if mask is None:
+            view_id = self._cam_name_to_id.get(view_name)
+            if view_id is not None and view_id in self._view_to_mask_path:
+                mask_path = self._view_to_mask_path[view_id]
+                mask = self._load_mask_from_file(mask_path)
+
+        if mask is None:
+            return None
+
+        # Resize if needed
+        if render_hw and (mask.shape[0] != render_hw[0] or mask.shape[1] != render_hw[1]):
+            mask = torch.nn.functional.interpolate(
+                mask.unsqueeze(0).unsqueeze(0), size=render_hw, mode="bilinear", align_corners=False
+            ).squeeze(0).squeeze(0)
+
+        self._mask_cache[view_name] = mask
+        return mask
+
+    def load_ssim_weight_for_view(self, view_name: str, render_hw: tuple = None) -> torch.Tensor:
+        """
+        Return SSIM weight map for a specific view.
+
+        Uses soft contribution mask from Step 9: values in [0, 1] where
+        1.0 = clean pixel, 0.0 = max noise contribution.
+
+        Args:
+            view_name: Camera image name (e.g., "_DSC9214.JPG")
+            render_hw: (H, W) tuple for resizing
+
+        Returns:
+            weight: [H, W] float tensor, 0.0 (noise) ~ 1.0 (clean), or None if unavailable
+        """
+        base_name = Path(view_name).stem if "." in view_name else view_name
+
+        if base_name not in self._name_to_contribution_soft:
+            return None
+
+        cache_key = f"{view_name}_ssim_weight"
+        if cache_key in self._mask_cache:
+            weight = self._mask_cache[cache_key]
+            if render_hw and (weight.shape[0] != render_hw[0] or weight.shape[1] != render_hw[1]):
+                weight = torch.nn.functional.interpolate(
+                    weight.unsqueeze(0).unsqueeze(0), size=render_hw, mode="bilinear", align_corners=False
+                ).squeeze(0).squeeze(0)
+            return weight
+
+        soft_path = self._name_to_contribution_soft[base_name]
+        weight = self._load_mask_from_file(soft_path)  # [H, W], 0~1
+
+        if render_hw and (weight.shape[0] != render_hw[0] or weight.shape[1] != render_hw[1]):
+            weight = torch.nn.functional.interpolate(
+                weight.unsqueeze(0).unsqueeze(0), size=render_hw, mode="bilinear", align_corners=False
+            ).squeeze(0).squeeze(0)
+
+        self._mask_cache[cache_key] = weight
+        return weight
 
     def generate_mask_from_rendered(self, rendered_image: torch.Tensor) -> torch.Tensor:
         """
