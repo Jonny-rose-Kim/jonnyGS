@@ -136,13 +136,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Noise-aware loss: weight noise pixels less in L1, use weighted SSIM
         noise_mask = None
-        ssim_weight = None
         if noise_loader is not None:
             render_hw = (image.shape[1], image.shape[2])
             noise_mask = noise_loader.load_noise_mask_for_view(
-                viewpoint_cam.image_name, render_hw=render_hw
-            )
-            ssim_weight = noise_loader.load_ssim_weight_for_view(
                 viewpoint_cam.image_name, render_hw=render_hw
             )
 
@@ -154,10 +150,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             Ll1 = l1_loss(image, gt_image)
 
-        if ssim_weight is not None:
-            ssim_weight = ssim_weight.to(image.device)
-            # [H, W] -> [1, 1, H, W] for fused_ssim weight_map
-            ssim_weight_4d = ssim_weight.unsqueeze(0).unsqueeze(0)
+        if noise_mask is not None:
+            # SSIM: same weighting as L1 (w=1.0 for clean, w=noise_loss_weight for noise)
+            ssim_weight_4d = l1_weight_map.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
         else:
             ssim_weight_4d = None
 
