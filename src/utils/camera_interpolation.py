@@ -750,3 +750,53 @@ def interpolate_cameras_pairwise_lookat(cam1, cam2, t=0.5, arc_interpolation=Tru
     ).squeeze(0)
 
     return interp_cam
+
+
+def verify_view_overlap(rendered_interp, rendered_cam1, rendered_cam2,
+                         min_valid_ratio=0.3, min_overlap_score=0.3):
+    """
+    보간 뷰가 원본 뷰들과 충분히 겹치는지 검증합니다.
+
+    두 가지 기준:
+    1. 유효 픽셀 비율 (검정/빈 영역이 너무 많으면 reject)
+    2. 원본 뷰와의 구조적 유사도 (cosine similarity)
+
+    Args:
+        rendered_interp: 보간 뷰 렌더링 [3, H, W]
+        rendered_cam1: cam1 렌더링 [3, H, W]
+        rendered_cam2: cam2 렌더링 [3, H, W]
+        min_valid_ratio: 최소 유효 픽셀 비율 (default 0.3)
+        min_overlap_score: 최소 유사도 (default 0.3)
+
+    Returns:
+        is_valid: bool
+        info: dict with valid_ratio, sim1, sim2
+    """
+    import torch.nn.functional as F
+
+    # 1. 유효 픽셀 비율
+    brightness = rendered_interp.mean(dim=0)  # [H, W]
+    valid_ratio = (brightness > 0.01).float().mean().item()
+
+    if valid_ratio < min_valid_ratio:
+        return False, {'valid_ratio': valid_ratio, 'sim1': 0.0, 'sim2': 0.0,
+                       'reason': 'low_valid_ratio'}
+
+    # 2. 원본 뷰와의 cosine similarity
+    flat_interp = rendered_interp.flatten().unsqueeze(0)
+    flat_cam1 = rendered_cam1.flatten().unsqueeze(0)
+    flat_cam2 = rendered_cam2.flatten().unsqueeze(0)
+
+    sim1 = F.cosine_similarity(flat_interp, flat_cam1).item()
+    sim2 = F.cosine_similarity(flat_interp, flat_cam2).item()
+
+    min_sim = min(sim1, sim2)
+    is_valid = min_sim >= min_overlap_score
+
+    info = {
+        'valid_ratio': valid_ratio,
+        'sim1': sim1,
+        'sim2': sim2,
+        'reason': 'ok' if is_valid else 'low_overlap'
+    }
+    return is_valid, info

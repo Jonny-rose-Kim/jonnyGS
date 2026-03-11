@@ -55,9 +55,13 @@ from src.utils.camera_interpolation import (
     interpolate_cameras, find_adjacent_camera_pairs,
     interpolate_cameras_look_at, compute_scene_center_robust,
     compute_scene_center_from_cameras, compute_scene_center_from_gaze,
-    estimate_scene_up_vector, interpolate_cameras_pairwise_lookat
+    estimate_scene_up_vector, interpolate_cameras_pairwise_lookat,
+    verify_view_overlap
 )
-from src.utils.camera_clustering import cluster_and_select_cameras, find_adjacent_pairs_in_cluster, extract_camera_positions
+from src.utils.camera_clustering import (
+    cluster_and_select_cameras, find_adjacent_pairs_in_cluster,
+    find_direction_aware_pairs, extract_camera_positions
+)
 from src.utils.ray_gaussian_intersection import find_intersecting_gaussians, find_visible_gaussians
 from src.utils.detector_inference import load_detector
 
@@ -176,7 +180,8 @@ def find_nearest_neighbor_pairs(cluster):
 
 def create_cluster_novel_views(cluster, max_views_per_cluster=None, num_interpolations=5,
                                 scene_center=None, use_look_at=True, arc_interpolation=True,
-                                world_up=None, pairwise_lookat=False, max_pairs=None):
+                                world_up=None, pairwise_lookat=False, max_pairs=None,
+                                interpolation_mode=None, min_direction_similarity=0.5):
     """
     클러스터 내에서 novel view 생성
     각 카메라 쌍에서 균등한 간격으로 여러 개의 novel view 생성
@@ -194,11 +199,21 @@ def create_cluster_novel_views(cluster, max_views_per_cluster=None, num_interpol
         world_up: Scene의 world up vector [3] (모든 카메라에서 추정됨)
         pairwise_lookat: True면 각 카메라 쌍의 시선 교차점을 바라보도록 보간
         max_pairs: None이면 nearest-neighbor 쌍만, 값이면 거리순 상위 K개 all-pairs 사용
+        interpolation_mode: 'slerp'이면 방향 유사도 기반 쌍 선택 + 순수 SLERP 보간
+        min_direction_similarity: slerp 모드에서 forward 방향 dot product 최소값
 
     Returns:
         novel_views: List[(interp_cam, cam1, cam2, t)]
     """
-    if max_pairs is not None:
+    # 카메라 쌍 선택
+    if interpolation_mode == 'slerp':
+        # 방향 유사도 기반 쌍 선택
+        effective_max_pairs = max_pairs if max_pairs is not None else 20
+        pairs = find_direction_aware_pairs(
+            cluster, max_pairs=effective_max_pairs,
+            min_direction_similarity=min_direction_similarity
+        )
+    elif max_pairs is not None:
         # All-pairs 모드: 거리순 상위 max_pairs개 쌍 사용 (nC2 중 선택)
         pairs = find_adjacent_pairs_in_cluster(cluster, max_pairs=max_pairs)
     else:
@@ -212,7 +227,10 @@ def create_cluster_novel_views(cluster, max_views_per_cluster=None, num_interpol
         for i in range(num_interpolations):
             t = (i + 1) / (num_interpolations + 1)
 
-            if pairwise_lookat:
+            if interpolation_mode == 'slerp':
+                # 순수 SLERP 보간: 위치 LERP + 방향 SLERP (look-at 없음)
+                interp_cam = interpolate_cameras(cam1, cam2, t=t)
+            elif pairwise_lookat:
                 # 카메라 쌍의 시선 교차점을 바라보는 보간
                 interp_cam = interpolate_cameras_pairwise_lookat(
                     cam1, cam2, t=t,
@@ -521,6 +539,19 @@ def main():
     parser.add_argument('--pairwise_lookat', action='store_true', default=False,
                        help='Use pairwise gaze intersection as look-at target (instead of global scene center)')
 
+    # 보간 모드 선택
+    parser.add_argument('--interpolation_mode', type=str, default=None,
+                       choices=['slerp', None],
+                       help='Interpolation mode: "slerp" uses direction-aware pair selection + '
+                            'pure SLERP interpolation + overlap verification. '
+                            'Overrides pairwise_lookat and use_look_at when set.')
+    parser.add_argument('--min_direction_similarity', type=float, default=0.5,
+                       help='Min forward direction dot product for camera pair selection '
+                            '(slerp mode only, 0.5 ≈ 60° max angle, default=0.5)')
+    parser.add_argument('--min_overlap_score', type=float, default=0.3,
+                       help='Min cosine similarity with source views for overlap verification '
+                            '(slerp mode only, default=0.3)')
+
     # Scene center 계산 방식
     parser.add_argument('--scene_center_method', type=str, default='camera',
                        choices=['camera', 'gaze', 'gaussian'],
@@ -593,9 +624,14 @@ def main():
     print(f"Pairwise look-at: {args.pairwise_lookat}")
     print(f"Arc interpolation: {args.arc_interpolation}")
     print(f"Min valid pixel ratio: {args.min_valid_ratio}")
-    print(f"Scene center method: {args.scene_center_method} {'(ignored, using pairwise)' if args.pairwise_lookat else ''}")
-    if args.scene_center:
-        print(f"Scene center override: {args.scene_center}")
+    if args.interpolation_mode == 'slerp':
+        print(f"Interpolation mode: SLERP (direction-aware pairs + pure SLERP + overlap verification)")
+        print(f"Min direction similarity: {args.min_direction_similarity}")
+        print(f"Min overlap score: {args.min_overlap_score}")
+    else:
+        print(f"Scene center method: {args.scene_center_method} {'(ignored, using pairwise)' if args.pairwise_lookat else ''}")
+        if args.scene_center:
+            print(f"Scene center override: {args.scene_center}")
     print("=" * 80 + "\n")
 
     # 경로 설정
@@ -694,7 +730,12 @@ def main():
 
     # total_views 계산: 각 클러스터의 쌍 수 * num_interpolations
     def estimate_views_for_cluster(cluster_size):
-        if args.max_pairs is not None:
+        if args.interpolation_mode == 'slerp':
+            # slerp 모드: 방향 필터링으로 쌍이 줄어들 수 있지만, 상한은 max_pairs
+            effective_max_pairs = args.max_pairs if args.max_pairs is not None else 20
+            n_all_pairs = cluster_size * (cluster_size - 1) // 2
+            num_pairs = min(n_all_pairs, effective_max_pairs)
+        elif args.max_pairs is not None:
             # all-pairs 모드: nC2 중 상위 max_pairs개
             n_all_pairs = cluster_size * (cluster_size - 1) // 2
             num_pairs = min(n_all_pairs, args.max_pairs)
@@ -776,7 +817,7 @@ def main():
             pair_visible = defaultdict(list)       # pair_key -> [Set[int], ...]
             cluster_view_metadata = []
 
-            # 클러스터 내 novel view 생성 (look-at 기반)
+            # 클러스터 내 novel view 생성
             novel_views = create_cluster_novel_views(
                 cluster,
                 max_views_per_cluster=args.views_per_cluster,
@@ -786,10 +827,25 @@ def main():
                 arc_interpolation=args.arc_interpolation,
                 world_up=world_up,
                 pairwise_lookat=args.pairwise_lookat,
-                max_pairs=args.max_pairs
+                max_pairs=args.max_pairs,
+                interpolation_mode=args.interpolation_mode,
+                min_direction_similarity=args.min_direction_similarity
             )
 
+            # slerp 모드: 원본 카메라 렌더링 캐시 (겹침 검증용)
+            source_render_cache = {}
+            if args.interpolation_mode == 'slerp':
+                unique_cams = set()
+                for _, cam1, cam2, _ in novel_views:
+                    unique_cams.add(cam1.image_name)
+                    unique_cams.add(cam2.image_name)
+                for _, cam1, cam2, _ in novel_views:
+                    for cam in [cam1, cam2]:
+                        if cam.image_name not in source_render_cache:
+                            source_render_cache[cam.image_name] = render_view(gaussians, cam, background)
+
             skipped_views = 0
+            skipped_overlap = 0
             for view_idx, (interp_cam, cam1, cam2, t) in enumerate(novel_views):
                 # 렌더링
                 rendered = render_view(gaussians, interp_cam, background)
@@ -800,6 +856,20 @@ def main():
                     skipped_views += 1
                     pbar.update(1)
                     continue
+
+                # slerp 모드: 원본 뷰와의 겹침 검증
+                if args.interpolation_mode == 'slerp':
+                    r_cam1 = source_render_cache[cam1.image_name]
+                    r_cam2 = source_render_cache[cam2.image_name]
+                    overlap_valid, overlap_info = verify_view_overlap(
+                        rendered, r_cam1, r_cam2,
+                        min_valid_ratio=args.min_valid_ratio,
+                        min_overlap_score=args.min_overlap_score
+                    )
+                    if not overlap_valid:
+                        skipped_overlap += 1
+                        pbar.update(1)
+                        continue
 
                 # 노이즈 마스크 예측
                 mask = detector.predict_from_tensor(rendered)
@@ -863,6 +933,8 @@ def main():
 
             if skipped_views > 0:
                 print(f"    Skipped {skipped_views} views with too much black (< {args.min_valid_ratio*100:.0f}% valid pixels)")
+            if skipped_overlap > 0:
+                print(f"    Skipped {skipped_overlap} views with low overlap (< {args.min_overlap_score} cosine similarity)")
 
             # 카메라 쌍 레벨 투표 → 클러스터 내 union
             print(f"    Pair-level voting for cluster {cluster_idx} ({len(pair_candidates)} pairs, threshold={args.vote_threshold})...")
@@ -995,6 +1067,9 @@ def main():
             'min_valid_ratio': args.min_valid_ratio,
             'scene_center_method': args.scene_center_method,
             'gaze_distance': args.gaze_distance,
+            'interpolation_mode': args.interpolation_mode,
+            'min_direction_similarity': args.min_direction_similarity,
+            'min_overlap_score': args.min_overlap_score,
         },
         'scene_center': scene_center.tolist() if scene_center is not None else None,
         'scene_center_manual': args.scene_center,

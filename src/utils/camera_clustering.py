@@ -204,6 +204,55 @@ def find_adjacent_pairs_in_cluster(cluster, max_pairs: int = None) -> List[Tuple
     return pairs
 
 
+def _get_camera_forward(cam) -> np.ndarray:
+    """카메라의 forward 방향 벡터 추출 (-Z in camera space)"""
+    R = cam.R if isinstance(cam.R, np.ndarray) else cam.R.cpu().numpy()
+    forward = -R[2, :]
+    return forward / (np.linalg.norm(forward) + 1e-8)
+
+
+def find_direction_aware_pairs(cluster, max_pairs: int = 20,
+                                min_direction_similarity: float = 0.5) -> List[Tuple]:
+    """
+    거리 + 방향 유사도를 함께 고려하여 카메라 쌍 선택.
+    두 카메라가 비슷한 방향을 바라보는 경우에만 쌍으로 인정하여,
+    보간 뷰의 시야 겹침을 보장합니다.
+
+    Args:
+        cluster: 카메라 리스트
+        max_pairs: 최대 쌍 수
+        min_direction_similarity: forward 방향 dot product 최소값 (0.5 ≈ 60°)
+
+    Returns:
+        pairs: List[(cam1, cam2, distance)] - score 순 정렬된 카메라 쌍
+    """
+    if len(cluster) < 2:
+        return []
+
+    positions = extract_camera_positions(cluster)
+    forwards = np.array([_get_camera_forward(cam) for cam in cluster])
+
+    pairs = []
+    for i in range(len(cluster)):
+        for j in range(i + 1, len(cluster)):
+            dist = np.linalg.norm(positions[i] - positions[j])
+            dir_sim = np.dot(forwards[i], forwards[j])
+
+            if dir_sim >= min_direction_similarity:
+                # score: 방향 유사도 높을수록 + 거리 가까울수록 좋음
+                score = dir_sim / (dist + 1e-6)
+                pairs.append((cluster[i], cluster[j], dist, dir_sim, score))
+
+    # score 순으로 정렬 (높을수록 좋음)
+    pairs.sort(key=lambda x: x[4], reverse=True)
+
+    if max_pairs is not None:
+        pairs = pairs[:max_pairs]
+
+    # 기존 인터페이스와 호환: (cam1, cam2, distance) 형태로 반환
+    return [(p[0], p[1], p[2]) for p in pairs]
+
+
 def get_cluster_statistics(clusters) -> dict:
     """
     클러스터들의 통계 정보 계산
