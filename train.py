@@ -40,7 +40,7 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, load_ply=None, noise_data_dir=None, noise_loss_weight=0.7):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, load_ply=None, noise_data_dir=None, noise_loss_weight=0.7, noise_min_lr_scale=0.3):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -68,7 +68,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if noise_data_dir:
         from src.utils.noise_loader import NoiseDataLoader
         noise_loader = NoiseDataLoader(noise_data_dir, device="cuda")
-        print(f"[NOISE] Noise-aware training enabled (loss_weight={noise_loss_weight})")
+        print(f"[NOISE] Noise-aware training enabled (loss_weight={noise_loss_weight}, min_lr_scale={noise_min_lr_scale})")
+
+        # Set per-Gaussian confidence scores for gradient scaling (Method C)
+        initial_confidence = noise_loader.load_confidence_scores(gaussians.get_xyz.shape[0])
+        gaussians.set_noise_confidence(initial_confidence)
+        n_affected = (initial_confidence > 0).sum().item()
+        print(f"[NOISE] Confidence scores set for {n_affected} Gaussians")
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -179,6 +185,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             Ll1depth = 0
 
         loss.backward()
+
+        # [NOISE] Confidence-weighted gradient scaling (Method C)
+        # Reduce gradients for noise Gaussians: lr_scale = 1.0 (clean) → noise_min_lr_scale (high confidence noise)
+        if noise_loader is not None and gaussians.noise_confidence is not None:
+            with torch.no_grad():
+                conf = gaussians.noise_confidence  # [N]
+                lr_scale = 1.0 - conf * (1.0 - noise_min_lr_scale)
+                if gaussians._xyz.grad is not None:
+                    gaussians._xyz.grad *= lr_scale.unsqueeze(-1)
+                if gaussians._scaling.grad is not None:
+                    gaussians._scaling.grad *= lr_scale.unsqueeze(-1)
+                if gaussians._rotation.grad is not None:
+                    gaussians._rotation.grad *= lr_scale.unsqueeze(-1)
+                if gaussians._opacity.grad is not None:
+                    gaussians._opacity.grad *= lr_scale.unsqueeze(-1)
+                if gaussians._features_dc.grad is not None:
+                    gaussians._features_dc.grad *= lr_scale.unsqueeze(-1).unsqueeze(-1)
+                if gaussians._features_rest.grad is not None:
+                    gaussians._features_rest.grad *= lr_scale.unsqueeze(-1).unsqueeze(-1)
 
         iter_end.record()
 
@@ -312,6 +337,8 @@ if __name__ == "__main__":
                        help="Path to noise_gaussians/ directory for noise-aware training")
     parser.add_argument("--noise_loss_weight", type=float, default=0.7,
                        help="Loss weight for noise pixels (0.0=ignore, 1.0=normal, default=0.7)")
+    parser.add_argument("--noise_min_lr_scale", type=float, default=0.3,
+                       help="Min gradient scale for noise Gaussians (0.0=freeze, 1.0=normal, default=0.3)")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -324,7 +351,7 @@ if __name__ == "__main__":
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.load_ply, args.noise_data_dir, args.noise_loss_weight)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.load_ply, args.noise_data_dir, args.noise_loss_weight, args.noise_min_lr_scale)
 
     # All done
     print("\nTraining complete.")

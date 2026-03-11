@@ -50,7 +50,7 @@ class GaussianModel:
     def __init__(self, sh_degree, optimizer_type="default"):
         self.active_sh_degree = 0
         self.optimizer_type = optimizer_type
-        self.max_sh_degree = sh_degree  
+        self.max_sh_degree = sh_degree
         self._xyz = torch.empty(0)
         self._features_dc = torch.empty(0)
         self._features_rest = torch.empty(0)
@@ -63,7 +63,12 @@ class GaussianModel:
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+        self.noise_confidence = None  # [N] tensor for confidence-weighted gradient scaling
         self.setup_functions()
+
+    def set_noise_confidence(self, scores):
+        """Set per-Gaussian noise confidence scores for confidence-weighted gradient scaling."""
+        self.noise_confidence = scores.to("cuda")
 
     def capture(self):
         return (
@@ -363,6 +368,9 @@ class GaussianModel:
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         self.tmp_radii = self.tmp_radii[valid_points_mask]
 
+        if self.noise_confidence is not None:
+            self.noise_confidence = self.noise_confidence[valid_points_mask]
+
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
@@ -405,6 +413,10 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
+        if self.noise_confidence is not None:
+            new_confidence = torch.zeros(new_xyz.shape[0], device="cuda")
+            self.noise_confidence = torch.cat([self.noise_confidence, new_confidence])
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
